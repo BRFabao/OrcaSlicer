@@ -76,6 +76,33 @@ jobs:
           if (-not (Test-Path "$cmakeBin\cmake.exe")) { throw "cmake.exe not found at $cmakeBin" }
           Add-Content -Path $env:GITHUB_PATH -Value $cmakeBin
 
+      # Compiler cache. Objects are keyed on the preprocessed source, the
+      # compiler binary and the flags, so a leg only ever hits its own entries.
+      # Pushes save (main keeps the cache warm); pull requests restore it and
+      # discard what they compiled, so the store does not grow per PR. A failed
+      # install only costs the caching, not the build.
+      - name: Compiler cache
+        id: ccache
+        if: ${{ !inputs.macos-combine-only }}
+        continue-on-error: true
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-${{ inputs.arch || 'amd64' }}${{ runner.os == 'Windows' && format('-{0}', inputs.compiler) || '' }}
+          max-size: 2G
+          # TEST: pull requests save too, so a second run on this branch measures
+          # a warm cache. Restore-only for pull_request before merge.
+          save: true
+
+      - name: Enable compiler cache
+        if: ${{ steps.ccache.outcome == 'success' }}
+        shell: bash
+        run: |
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          # Needed for precompiled headers and for headers a fresh checkout
+          # has just written.
+          echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime" >> "$GITHUB_ENV"
+
       - name: Get the version and date on Ubuntu and macOS
         if: runner.os != 'Windows'
         run: |
@@ -670,3 +697,8 @@ jobs:
           asset_name: orca_custom_preset_tests.zip
           asset_content_type: application/octet-stream
           max_releases: 1
+
+      - name: Compiler cache statistics
+        if: ${{ always() && steps.ccache.outcome == 'success' }}
+        shell: bash
+        run: ccache -s -v || ccache -s
