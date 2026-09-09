@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <vector>
 #include <string>
@@ -1549,7 +1550,7 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
     glb_support |= glb_config.opt_int("raft_layers") > 0;
 
 	for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
-		if (!contain_instance_totally(obj_idx, 0))
+		if (!contain_any_instance_totally(obj_idx))
 			continue;
 
 		ModelObject* mo = m_model->objects[obj_idx];
@@ -1899,7 +1900,7 @@ std::vector<int> PartPlate::get_extruders_without_support(bool conside_custom_gc
 	const DynamicPrintConfig& glb_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
 
 	for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
-		if (!contain_instance_totally(obj_idx, 0))
+		if (!contain_any_instance_totally(obj_idx))
 			continue;
 
 		ModelObject* mo = m_model->objects[obj_idx];
@@ -2070,7 +2071,7 @@ bool PartPlate::check_single_extruder_mixed_filament_risk(const DynamicPrintConf
                                             "which may significantly increase waste and the risk of nozzle / waste-chute clogging.");
 
     for (int obj_idx = 0; obj_idx < (int)m_model->objects.size(); ++obj_idx) {
-        if (!contain_instance_totally(obj_idx, 0))
+        if (!contain_any_instance_totally(obj_idx))
             continue;
         ModelObject *mo = m_model->objects[obj_idx];
         int obj_ext = mo->config.has("extruder") ? mo->config.extruder() : 1;
@@ -2289,7 +2290,7 @@ bool PartPlate::check_compatible_of_nozzle_and_filament(const DynamicPrintConfig
         return wipe_tower_size;
 
     for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
-        if (!use_global_objects && !contain_instance_totally(obj_idx, 0))
+        if (!use_global_objects && !contain_any_instance_totally(obj_idx))
             continue;
 
         BoundingBoxf3 bbox = m_model->objects[obj_idx]->bounding_box();
@@ -2332,7 +2333,7 @@ Vec3d PartPlate::estimate_wipe_tower_size(const DynamicPrintConfig & config, con
         return wipe_tower_size;
 
     for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
-        if (!use_global_objects && !contain_instance_totally(obj_idx, 0))
+        if (!use_global_objects && !contain_any_instance_totally(obj_idx))
             continue;
 
 		BoundingBoxf3 bbox = m_model->objects[obj_idx]->bounding_box_exact();
@@ -2753,6 +2754,20 @@ bool PartPlate::contain_instance_totally(int obj_id, int instance_id) const
 	}
 
 	return result;
+}
+
+//judge whether any instance of the object is totally included in plate or not
+bool PartPlate::contain_any_instance_totally(int obj_id) const
+{
+	// obj_to_instance_set is ordered by (obj_id, instance_id), so the object's entries are contiguous.
+	for (auto it = obj_to_instance_set.lower_bound(std::pair(obj_id, std::numeric_limits<int>::min()));
+		it != obj_to_instance_set.end() && it->first == obj_id; ++it)
+	{
+		if (instance_outside_set.find(*it) == instance_outside_set.end())
+			return true;
+	}
+
+	return false;
 }
 
 //check whether instance is outside the plate or not

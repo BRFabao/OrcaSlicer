@@ -366,6 +366,8 @@ public:
     bool contain_instance_totally(ModelObject* object, int instance_id) const;
     //judge whether instance is totally included in plate or not
     bool contain_instance_totally(int obj_id, int instance_id) const;
+    //judge whether any instance of the object is totally included in plate or not
+    bool contain_any_instance_totally(int obj_id) const;
 
     //judge whether the plate's origin is at the left of instance or not
     bool is_left_top_of(int obj_id, int instance_id);
