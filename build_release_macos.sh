@@ -255,6 +255,7 @@ function build_slicer() {
             mkdir -p "$PROJECT_BUILD_DIR"
             cd "$PROJECT_BUILD_DIR"
             if [ "1." != "$BUILD_ONLY". ]; then
+                read -r -a EXTRA_BUILD_ARGS <<< "${ORCA_EXTRA_BUILD_ARGS:-}"
                 cmake "${PROJECT_DIR}" \
                     -G "${SLICER_CMAKE_GENERATOR}" \
                     -DORCA_TOOLS=ON \
@@ -264,7 +265,8 @@ function build_slicer() {
                     -DCMAKE_OSX_ARCHITECTURES="${_ARCH}" \
                     -DCMAKE_OSX_DEPLOYMENT_TARGET="${OSX_DEPLOYMENT_TARGET}" \
                     -DCMAKE_IGNORE_PREFIX_PATH="${CMAKE_IGNORE_PREFIX_PATH}" \
-                    ${CMAKE_POLICY_COMPAT}
+                    ${CMAKE_POLICY_COMPAT} \
+                    "${EXTRA_BUILD_ARGS[@]}"
             fi
             cmake --build . --config "$BUILD_CONFIG" --target "$SLICER_BUILD_TARGET"
         )
