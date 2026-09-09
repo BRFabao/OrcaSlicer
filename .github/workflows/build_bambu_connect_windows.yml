@@ -1,0 +1,18 @@
+name: Build Orca 2.4.2 with Bambu Connect (Windows x64)
+
+on:
+  push:
+    branches:
+      - fabao/orca-2.4.2-bambu-connect
+  workflow_dispatch:
+
+jobs:
+  build_windows_x64:
+    name: Build Windows x64 portable
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      build-deps-only: false
+      force-build: false
+    secrets: inherit

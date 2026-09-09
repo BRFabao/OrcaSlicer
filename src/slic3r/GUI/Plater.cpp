@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <numeric>
 #include <limits>
+#include <ctime>
 #include <vector>
 #include <string>
 #include <regex>
@@ -4738,6 +4739,7 @@ struct Plater::priv
     void on_action_send_gcode(SimpleEvent&);
     void on_action_export_sliced_file(SimpleEvent&);
     void on_action_export_all_sliced_file(SimpleEvent&);
+    void on_action_bambu_connect_export(SimpleEvent&);
     void on_action_select_sliced_plate(wxCommandEvent& evt);
     //BBS: change dark/light mode
     void on_change_color_mode(SimpleEvent& evt);
@@ -5311,6 +5313,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         q->Bind(EVT_PUBLISH_FINISHED, [q](wxCommandEvent& evt) { q->publish_job_finished(evt);});
         q->Bind(EVT_OPEN_PLATESETTINGSDIALOG, [q](wxCommandEvent& evt) { q->open_platesettings_dialog(evt);});
         q->Bind(EVT_OPEN_FILAMENT_MAP_SETTINGS_DIALOG, [q](wxCommandEvent &evt) { q->open_filament_map_setting_dialog(evt); });
+        q->Bind(EVT_GLTOOLBAR_BAMBU_CONNECT_EXPORT, &priv::on_action_bambu_connect_export, this);
         //q->Bind(EVT_GLVIEWTOOLBAR_ASSEMBLE, [q](SimpleEvent&) { q->select_view_3D("Assemble"); });
     }
 
@@ -10377,6 +10380,14 @@ void Plater::priv::on_action_export_all_sliced_file(SimpleEvent &)
     }
 }
 
+void Plater::priv::on_action_bambu_connect_export(SimpleEvent&)
+{
+    if (q != nullptr) {
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received Bambu Connect export event\n";
+        q->export_gcode_3mf_to_bambu_connect();
+    }
+}
+
 void Plater::priv::on_action_export_to_sdcard(SimpleEvent&)
 {
 	if (q != nullptr) {
@@ -15036,6 +15047,87 @@ void Plater::export_gcode_3mf(bool export_all)
         appconfig.update_last_output_dir(output_path.parent_path().string(), false);
         p->notification_manager->push_exporting_finished_notification(output_path.string(), p->last_output_dir_path, on_removable);
     }
+}
+
+static void purge_stale_bambu_connect_exports()
+{
+    constexpr std::time_t retention_seconds = 24 * 60 * 60;
+    const std::time_t cutoff = std::time(nullptr) - retention_seconds;
+
+    boost::system::error_code ec;
+    const fs::path temp_dir = fs::temp_directory_path(ec);
+    if (ec)
+        return;
+
+    fs::directory_iterator it(temp_dir, ec);
+    const fs::directory_iterator end;
+    while (!ec && it != end) {
+        const fs::path candidate = it->path();
+        const std::string filename = candidate.filename().string();
+        ec.clear();
+
+        if (boost::starts_with(filename, "." SLIC3R_APP_KEY ".bambu-connect.") &&
+            boost::ends_with(filename, ".gcode.3mf") &&
+            fs::is_regular_file(candidate, ec)) {
+            ec.clear();
+            const std::time_t modified = fs::last_write_time(candidate, ec);
+            if (!ec && modified < cutoff)
+                fs::remove(candidate, ec);
+        }
+
+        ec.clear();
+        it.increment(ec);
+    }
+}
+
+void Plater::export_gcode_3mf_to_bambu_connect()
+{
+    if (!wxGetApp().preset_bundle || !wxGetApp().preset_bundle->is_bbl_vendor())
+        return;
+
+    purge_stale_bambu_connect_exports();
+
+    fs::path output_path = fs::temp_directory_path()
+        / fs::unique_path("." SLIC3R_APP_KEY ".bambu-connect.%%%%-%%%%-%%%%-%%%%.gcode.3mf");
+
+    const std::string export_filename = Slic3r::fold_utf8_to_ascii(
+        into_u8(get_export_gcode_filename(".gcode.3mf", true, false)));
+    std::string display_name = export_filename;
+    if (boost::iends_with(display_name, ".gcode.3mf"))
+        display_name.erase(display_name.size() - 10);
+
+    const bool path_on_removable_media = false;
+    p->notification_manager->new_export_began(path_on_removable_media);
+    p->exporting_status = ExportingStatus::EXPORTING_TO_LOCAL;
+    p->last_output_path = output_path.string();
+    p->last_output_dir_path = output_path.parent_path().string();
+
+    const int plate_idx = get_partplate_list().get_curr_plate_index();
+
+    const int ret = export_3mf(output_path, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel, plate_idx);
+    if (ret < 0) {
+        boost::system::error_code ec;
+        fs::remove(output_path, ec);
+        show_error(this, _L("Failed to export sliced file for Bambu Connect."), false);
+        return;
+    }
+
+    if (!fs::exists(output_path)) {
+        show_error(this, _L("Failed to export sliced file for Bambu Connect."), false);
+        return;
+    }
+
+    const std::string url = "bambu-connect://import-file?path=" + Http::url_encode(output_path.string())
+        + "&name=" + Http::url_encode(display_name)
+        + "&version=1.0.0";
+    if (!wxLaunchDefaultBrowser(from_u8(url))) {
+        boost::system::error_code ec;
+        fs::remove(output_path, ec);
+        show_error(this, _L("Failed to open Bambu Connect. Please make sure Bambu Connect is installed."), false);
+        return;
+    }
+
+    p->notification_manager->push_exporting_finished_notification(export_filename, p->last_output_dir_path, false);
 }
 
 void Plater::send_gcode_finish(wxString name)
