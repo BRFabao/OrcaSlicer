@@ -8,6 +8,7 @@
 #include "GUI_App.hpp"
 #include "GUI_Preview.hpp"
 #include "MainFrame.hpp"
+#include "BaleiaConnectBridge.hpp"
 #include "format.hpp"
 #include "Widgets/ProgressDialog.hpp"
 #include "Widgets/RoundedRectangle.hpp"
@@ -2569,6 +2570,54 @@ void SelectMachineDialog::on_send_print()
 
     BOOST_LOG_TRIVIAL(info) << "print_job: timelapse_option = " << timelapse_option;
     BOOST_LOG_TRIVIAL(info) << "print_job: use_ams = " << m_print_job->task_use_ams;
+
+#ifdef _WIN32
+    // Bambu's authenticated transport is owned by Bambu Connect. Keep every
+    // upstream validation and final choice made by this dialog, but hand the
+    // completed package to the local Baleia queue before the blocked network
+    // job is created. Other printer vendors continue through the original path.
+    const bool route_through_bambu_connect =
+        m_print_type == PrintFromType::FROM_NORMAL && wxGetApp().preset_bundle &&
+        wxGetApp().preset_bundle->is_bbl_vendor();
+    if (route_through_bambu_connect) {
+        PrintPrepareData print_data;
+        m_plater->get_print_job_data(&print_data);
+
+        BaleiaConnectJob bridge_job;
+        bridge_job.source_path      = print_data._3mf_path;
+        bridge_job.display_name     = m_current_project_name.utf8_string();
+        bridge_job.printer_id       = m_printer_last_select;
+        bridge_job.printer_name     = obj_->get_dev_name();
+        bridge_job.printer_model    = obj_->printer_type;
+        bridge_job.ams_mapping      = m_print_job->task_ams_mapping;
+        bridge_job.ams_mapping2     = m_print_job->task_ams_mapping2;
+        bridge_job.ams_mapping_info = m_print_job->task_ams_mapping_info;
+        bridge_job.nozzles_info     = m_print_job->task_nozzles_info;
+        bridge_job.bed_type         = m_print_job->task_bed_type;
+        bridge_job.use_ams          = m_print_job->task_use_ams;
+        bridge_job.bed_leveling     = m_print_job->task_bed_leveling;
+        bridge_job.flow_calibration = m_print_job->task_flow_cali;
+        bridge_job.timelapse        = m_print_job->task_record_timelapse;
+
+        std::string bridge_error;
+        if (!BaleiaConnect::queue_job(bridge_job, &bridge_error)) {
+            prepare_mode();
+            MessageDialog dialog(this,
+                                 _L("Baleia could not hand this print to Bambu Connect.") + "\n\n" + from_u8(bridge_error),
+                                 "Baleia Connect", wxOK | wxICON_ERROR);
+            dialog.ShowModal();
+            return;
+        }
+
+        m_plater->record_slice_preset("print");
+        prepare_mode();
+        auto *event = new wxCommandEvent(m_plater->get_print_finished_event());
+        event->SetString(from_u8(m_printer_last_select));
+        wxQueueEvent(m_plater, event);
+        BOOST_LOG_TRIVIAL(info) << "print_job: handed to Baleia Connect queue";
+        return;
+    }
+#endif
 
     m_print_job->on_success([this]() { finish_mode(); });
 

@@ -1,0 +1,14 @@
+BALEIA ORCA - DADOS PORTATEIS
+
+Esta pasta-marcador faz o pacote criar e usar "data_dir" ao lado do executavel.
+Perfis de impressora, filamentos e configuracoes ficam independentes do OrcaSlicer original.
+
+Na primeira abertura, a Baleia copia os dados existentes do OrcaSlicer automaticamente.
+Ao fechar normalmente, uma copia completa e rotativa e criada na pasta "Backups".
+As cinco copias mais recentes sao mantidas.
+
+Para levar tudo a outra versao da Baleia, copie estas pastas junto do novo pacote:
+  data_dir
+  Backups
+
+A fila e os arquivos temporarios ficam em "BaleiaConnect" e sao limpos automaticamente.

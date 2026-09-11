@@ -79,6 +79,7 @@
 
 #include "GUI.hpp"
 #include "GUI_Utils.hpp"
+#include "BaleiaConnectBridge.hpp"
 #include "3DScene.hpp"
 #include "MainFrame.hpp"
 #include "Plater.hpp"
@@ -1034,6 +1035,11 @@ void GUI_App::post_init()
            }
         }
     }
+#ifdef _WIN32
+    // Open Connect with Baleia once the UI is alive. The companion owns its
+    // tray behavior and exits automatically with this process.
+    CallAfter([] { BaleiaConnect::start_helper(); });
+#endif
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 //BBS: remove the single instance currently
 #ifdef _WIN32
@@ -2401,7 +2407,15 @@ void GUI_App::init_app_config()
         _app_folder = _app_folder.parent_path().parent_path().parent_path();
 #endif
         boost::filesystem::path app_data_dir_path = _app_folder / "data_dir";
-        if (boost::filesystem::exists(app_data_dir_path)) {
+        bool portable_data_ready = false;
+#ifdef __WINDOWS__
+        const boost::filesystem::path legacy_data_dir(
+            wxStandardPaths::Get().GetUserDataDir().ToUTF8().data());
+        portable_data_ready = BaleiaConnect::prepare_portable_data_directory(_app_folder, legacy_data_dir);
+#endif
+        if (portable_data_ready) {
+            // BaleiaConnect selected and prepared the application-local data_dir.
+        } else if (boost::filesystem::exists(app_data_dir_path)) {
             set_data_dir(app_data_dir_path.string());
         }
         else{
@@ -2614,6 +2628,11 @@ int GUI_App::OnExit()
     } catch (...) {
         BOOST_LOG_TRIVIAL(error) << "Failed to clean up encrypt bbl network log file";
     }
+
+#ifdef _WIN32
+    // MainFrame::shutdown has already flushed app_config at this point.
+    BaleiaConnect::create_portable_backup();
+#endif
 
     return wxApp::OnExit();
 }

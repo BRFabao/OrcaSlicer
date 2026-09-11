@@ -38,6 +38,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Auxiliary.hpp
     GUI/BackgroundSlicingProcess.cpp
     GUI/BackgroundSlicingProcess.hpp
+    GUI/BaleiaConnectBridge.cpp
+    GUI/BaleiaConnectBridge.hpp
     GUI/BBLStatusBarBind.cpp
     GUI/BBLStatusBarBind.hpp
     GUI/BBLStatusBar.cpp
