@@ -15,12 +15,26 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Accessibility
 
-Add-Type @'
+$nativeSource = @'
 using System;
+using System.Collections.Generic;
+using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
 
 public static class BaleiaNativeWindow
 {
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
@@ -28,12 +42,134 @@ public static class BaleiaNativeWindow
     public static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
-    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr window, out RECT rectangle);
+
+    public static IntPtr FindLargestTopWindow(int[] processIds)
+    {
+        if (processIds == null || processIds.Length == 0) return IntPtr.Zero;
+        HashSet<uint> wanted = new HashSet<uint>();
+        foreach (int processId in processIds)
+            if (processId > 0) wanted.Add((uint)processId);
+
+        IntPtr best = IntPtr.Zero;
+        long bestArea = -1;
+        EnumWindows(delegate(IntPtr window, IntPtr unused)
+        {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (!wanted.Contains(processId)) return true;
+
+            RECT rectangle;
+            long area = 0;
+            if (GetWindowRect(window, out rectangle))
+                area = Math.Max(0, rectangle.Right - rectangle.Left) *
+                    (long)Math.Max(0, rectangle.Bottom - rectangle.Top);
+            if (area > bestArea)
+            {
+                best = window;
+                bestArea = area;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return best;
+    }
+}
+
+public sealed class BaleiaStatusToast : Form
+{
+    private readonly Timer closeTimer;
+    private readonly bool connected;
+
+    private BaleiaStatusToast(string message, bool isConnected)
+    {
+        connected = isConnected;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        BackColor = Color.FromArgb(35, 39, 47);
+        ForeColor = Color.White;
+        ClientSize = new Size(300, 72);
+
+        Rectangle area = Screen.PrimaryScreen == null
+            ? new Rectangle(0, 0, 1024, 768)
+            : Screen.PrimaryScreen.WorkingArea;
+        Location = new Point(
+            Math.Max(area.Left, area.Right - Width - 18),
+            Math.Max(area.Top, area.Bottom - Height - 18));
+
+        Label title = new Label();
+        title.AutoSize = false;
+        title.Location = new Point(58, 15);
+        title.Size = new Size(225, 42);
+        title.TextAlign = ContentAlignment.MiddleLeft;
+        title.Font = new Font("Segoe UI", 12.0f, FontStyle.Bold);
+        title.ForeColor = Color.White;
+        title.BackColor = Color.Transparent;
+        title.Text = message ?? String.Empty;
+        Controls.Add(title);
+
+        closeTimer = new Timer();
+        closeTimer.Interval = 3500;
+        closeTimer.Tick += delegate
+        {
+            closeTimer.Stop();
+            Close();
+        };
+        Shown += delegate { closeTimer.Start(); };
+    }
+
+    protected override bool ShowWithoutActivation
+    {
+        get { return true; }
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams parameters = base.CreateParams;
+            parameters.ExStyle |= 0x08000000;
+            parameters.ExStyle |= 0x00000080;
+            return parameters;
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs args)
+    {
+        base.OnPaint(args);
+        using (SolidBrush brush = new SolidBrush(
+            connected ? Color.FromArgb(24, 190, 88) : Color.FromArgb(230, 62, 62)))
+        {
+            args.Graphics.SmoothingMode =
+                System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            args.Graphics.FillEllipse(brush, 20, 22, 28, 28);
+        }
+    }
+
+    public static void Display(string message, bool connected)
+    {
+        BaleiaStatusToast toast = new BaleiaStatusToast(message, connected);
+        toast.Show();
+    }
 }
 '@
+Add-Type -TypeDefinition $nativeSource -ReferencedAssemblies @(
+    [System.Windows.Forms.Form].Assembly.Location,
+    [System.Drawing.Color].Assembly.Location
+)
 
 if (-not ('BaleiaMsaaBridge' -as [type])) {
     $msaaSource = @'
@@ -125,6 +261,63 @@ public static class BaleiaMsaaBridge
             IntPtr.Zero,
             SPIF_SENDCHANGE))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static string GetConnectionState(IntPtr topWindow)
+    {
+        if (topWindow == IntPtr.Zero) return "checking";
+
+        bool sawMyPrinters = false;
+        bool sawPrinterCard = false;
+        bool sawNamedAccount = false;
+        bool sawLoginAction = false;
+
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            foreach (Entry entry in Flatten(root))
+            {
+                string name = Clean(entry.Name);
+                if (String.IsNullOrWhiteSpace(name)) continue;
+
+                if (EqualName(name, "My Printers"))
+                    sawMyPrinters = true;
+                if (name.IndexOf("Bed:", StringComparison.OrdinalIgnoreCase) >= 0)
+                    sawPrinterCard = true;
+                if (EqualName(name, "Sign in") ||
+                    EqualName(name, "Log in") ||
+                    EqualName(name, "Login") ||
+                    EqualName(name, "Entrar") ||
+                    name.IndexOf("Fazer login", StringComparison.OrdinalIgnoreCase) >= 0)
+                    sawLoginAction = true;
+
+                if (name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string candidate = Regex.Replace(
+                        name,
+                        @"chevron_down|expand_more|arrow_drop_down",
+                        " ",
+                        RegexOptions.IgnoreCase);
+                    candidate = Regex.Replace(candidate, @"\s+", " ").Trim();
+                    string meaningful = Regex.Replace(
+                        candidate,
+                        @"\b(account|avatar|person|profile|user|menu|circle|icon)\b",
+                        " ",
+                        RegexOptions.IgnoreCase);
+                    meaningful = Regex.Replace(meaningful, @"\s+", " ").Trim();
+                    bool genericSelector = Regex.IsMatch(
+                        meaningful,
+                        @"^(device\s+name|sort|printer|impressora)$",
+                        RegexOptions.IgnoreCase);
+                    if (!genericSelector &&
+                        Regex.IsMatch(meaningful, @"[\p{L}\p{Nd}]{2,}"))
+                        sawNamedAccount = true;
+                }
+            }
+        }
+
+        if (sawNamedAccount || sawPrinterCard) return "connected";
+        if (sawLoginAction || sawMyPrinters) return "disconnected";
+        return "checking";
     }
 
     public static bool HasDialog(IntPtr topWindow, string dialogName)
@@ -360,18 +553,21 @@ public static class BaleiaMsaaBridge
 
     private static List<IAccessible> Roots(IntPtr topWindow)
     {
+        List<IAccessible> roots = new List<IAccessible>();
+        if (topWindow == IntPtr.Zero) return roots;
+
         List<IntPtr> windows = new List<IntPtr>();
         windows.Add(topWindow);
         EnumWindowsProc callback = delegate(IntPtr child, IntPtr unused)
         {
-            windows.Add(child);
+            if (child != IntPtr.Zero) windows.Add(child);
             return true;
         };
         EnumChildWindows(topWindow, callback, IntPtr.Zero);
 
-        List<IAccessible> roots = new List<IAccessible>();
         foreach (IntPtr window in windows)
         {
+            if (window == IntPtr.Zero) continue;
             IAccessible accessible;
             Guid iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
             int result = AccessibleObjectFromWindow(
@@ -627,11 +823,21 @@ $script:WorkingDir = Join-Path $script:BridgeRoot 'Processando'
 $script:ErrorDir = Join-Path $script:BridgeRoot 'Erros'
 $script:RuntimeDir = Join-Path $script:BridgeRoot 'Runtime'
 $script:LogPath = Join-Path $script:RuntimeDir 'helper.log'
+$script:StatusPath = Join-Path $script:RuntimeDir 'connect.status'
 $script:StopRequested = $false
-$script:TrayMode = $false
 $script:ConnectExecutable = $null
 $script:NotifyIcon = $null
+$script:ManualVisible = $false
+$script:LoginVisible = $false
+$script:ConnectionStatus = 'checking'
+$script:CandidateStatus = 'checking'
+$script:CandidateSince = [DateTime]::UtcNow
+$script:LastStatusWrite = [DateTime]::MinValue
+$script:NextConnectStart = [DateTime]::MinValue
 $script:SendMayHaveBeenInvoked = $false
+$script:QueueBlocked = $false
+$script:ScreenReaderChanged = $false
+$script:ScreenReaderWasEnabled = $true
 
 @($script:PendingDir, $script:WorkingDir, $script:ErrorDir, $script:RuntimeDir) | ForEach-Object {
     [void](New-Item -ItemType Directory -Force -Path $_)
@@ -649,6 +855,108 @@ function Test-BaleiaRunning {
     return [bool](Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)
 }
 
+function Show-StatusToast {
+    param([string]$Message, [bool]$Connected)
+    try { [BaleiaStatusToast]::Display($Message, $Connected) } catch {}
+}
+
+function Write-ConnectionStatusFile {
+    param([string]$Status, [switch]$Force)
+    if (-not $Force -and
+        $Status -eq $script:ConnectionStatus -and
+        ([DateTime]::UtcNow - $script:LastStatusWrite).TotalSeconds -lt 4) {
+        return
+    }
+    try {
+        $partial = $script:StatusPath + '.partial'
+        [IO.File]::WriteAllText($partial, $Status, [Text.Encoding]::ASCII)
+        Move-Item -LiteralPath $partial -Destination $script:StatusPath -Force
+        $script:LastStatusWrite = [DateTime]::UtcNow
+    } catch {}
+}
+
+function Set-ConnectionStatus {
+    param([ValidateSet('checking', 'connected', 'disconnected', 'missing', 'error')][string]$Status)
+    $changed = $script:ConnectionStatus -ne $Status
+    $script:ConnectionStatus = $Status
+    Write-ConnectionStatusFile $Status -Force:$changed
+    if (-not $changed) { return }
+
+    Write-BaleiaLog ('Connection status: ' + $Status)
+    switch ($Status) {
+        'connected' {
+            Show-StatusToast 'Conectado' $true
+            if ($script:LoginVisible) {
+                $script:LoginVisible = $false
+                if (-not $script:ManualVisible) { Hide-ConnectWindow }
+            }
+        }
+        'disconnected' {
+            Show-StatusToast 'Desconectado' $false
+            if (-not $script:ManualVisible -and -not $script:LoginVisible) {
+                Show-ConnectWindow -ForLogin
+            }
+        }
+        'missing' { Show-StatusToast 'Bambu Connect nao encontrado' $false }
+        'error' { Show-StatusToast 'Erro no Bambu Connect' $false }
+    }
+}
+
+function Get-RawConnectionStatus {
+    if (-not $script:ConnectExecutable -or
+        -not (Test-Path -LiteralPath $script:ConnectExecutable)) {
+        return 'missing'
+    }
+
+    $processes = @(Get-ConnectProcesses)
+    if ($processes.Count -eq 0) {
+        if ([DateTime]::UtcNow -ge $script:NextConnectStart) {
+            $script:NextConnectStart = [DateTime]::UtcNow.AddSeconds(5)
+            [void](Ensure-ConnectRunning)
+        }
+        return 'checking'
+    }
+
+    $handle = Get-ConnectWindow
+    if ($handle -eq [IntPtr]::Zero) { return 'checking' }
+    try {
+        return [string][BaleiaMsaaBridge]::GetConnectionState($handle)
+    } catch {
+        Write-BaleiaLog ('Connection check failed: ' + $_.Exception.Message)
+        return 'checking'
+    }
+}
+
+function Update-ConnectionStatus {
+    $raw = Get-RawConnectionStatus
+    $now = [DateTime]::UtcNow
+    if ($raw -ne $script:CandidateStatus) {
+        $script:CandidateStatus = $raw
+        $script:CandidateSince = $now
+    }
+
+    $delaySeconds = switch ($raw) {
+        'connected' { 1 }
+        'disconnected' { 7 }
+        'checking' { 3 }
+        default { 0 }
+    }
+    if (($now - $script:CandidateSince).TotalSeconds -ge $delaySeconds) {
+        Set-ConnectionStatus $raw
+    } else {
+        Write-ConnectionStatusFile $script:ConnectionStatus
+    }
+}
+
+function Test-ConnectExecutablePath {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $leaf = [IO.Path]::GetFileName($Path)
+    return ($leaf -match '^Bambu[ ._-]*Connect\.exe$')
+}
+
 function Get-ConnectExecutableFromRegistry {
     $registryKeys = @(
         'Registry::HKEY_CURRENT_USER\Software\Classes\bambu-connect\shell\open\command',
@@ -658,10 +966,10 @@ function Get-ConnectExecutableFromRegistry {
     foreach ($key in $registryKeys) {
         try {
             $command = (Get-Item -LiteralPath $key).GetValue('')
-            if ($command -match '^\s*"([^"]+\.exe)"' -and (Test-Path -LiteralPath $Matches[1])) {
+            if ($command -match '^\s*"([^"]+\.exe)"' -and (Test-ConnectExecutablePath $Matches[1])) {
                 return $Matches[1]
             }
-            if ($command -match '^\s*([^\s]+\.exe)' -and (Test-Path -LiteralPath $Matches[1])) {
+            if ($command -match '^\s*([^\s]+\.exe)' -and (Test-ConnectExecutablePath $Matches[1])) {
                 return $Matches[1]
             }
         } catch {}
@@ -683,23 +991,25 @@ function Find-ConnectExecutable {
         $candidates += (Join-Path ${env:ProgramFiles(x86)} 'Bambu Connect\Bambu Connect.exe')
     }
     foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+        if (Test-ConnectExecutablePath $candidate) { return $candidate }
     }
     return $null
 }
 
 function Get-ConnectProcesses {
     $result = @()
+    if (-not $script:ConnectExecutable) { return @($result) }
+
     try {
-        foreach ($process in (Get-Process -ErrorAction SilentlyContinue)) {
+        foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
             try {
-                $titleMatch = $process.MainWindowTitle -like '*Bambu Connect*'
-                $nameMatch = $process.ProcessName -match '^Bambu[ ._-]*Connect$'
-                $pathMatch = $false
-                if ($script:ConnectExecutable -and $process.Path) {
-                    $pathMatch = [string]::Equals($process.Path, $script:ConnectExecutable, [StringComparison]::OrdinalIgnoreCase)
+                if ($process.Path -and
+                    [string]::Equals(
+                        [IO.Path]::GetFullPath($process.Path),
+                        [IO.Path]::GetFullPath($script:ConnectExecutable),
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    $result += $process
                 }
-                if ($titleMatch -or $nameMatch -or $pathMatch) { $result += $process }
             } catch {}
         }
     } catch {}
@@ -707,13 +1017,14 @@ function Get-ConnectProcesses {
 }
 
 function Get-ConnectWindow {
-    foreach ($process in (Get-ConnectProcesses)) {
-        try {
-            $process.Refresh()
-            if ($process.MainWindowHandle -ne [IntPtr]::Zero) { return $process.MainWindowHandle }
-        } catch {}
+    $processes = @(Get-ConnectProcesses)
+    if ($processes.Count -eq 0) { return [IntPtr]::Zero }
+    $ids = @($processes | ForEach-Object { [int]$_.Id })
+    try {
+        return [BaleiaNativeWindow]::FindLargestTopWindow([int[]]$ids)
+    } catch {
+        return [IntPtr]::Zero
     }
-    return [IntPtr]::Zero
 }
 
 function Wait-ConnectWindow {
@@ -724,20 +1035,27 @@ function Wait-ConnectWindow {
         $handle = Get-ConnectWindow
         if ($handle -ne [IntPtr]::Zero) { return $handle }
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     return [IntPtr]::Zero
 }
 
 function Ensure-ConnectRunning {
-    if ((Get-ConnectProcesses).Count -gt 0) { return $true }
+    $processes = @(Get-ConnectProcesses)
+    if ($processes.Count -gt 0) { return $true }
+    if (-not $script:ConnectExecutable -or
+        -not (Test-Path -LiteralPath $script:ConnectExecutable)) {
+        return $false
+    }
+
     try {
-        if ($script:ConnectExecutable -and (Test-Path -LiteralPath $script:ConnectExecutable)) {
-            Start-Process -FilePath $script:ConnectExecutable | Out-Null
-        } else {
-            Start-Process 'bambu-connect://' | Out-Null
+        Start-Process -FilePath $script:ConnectExecutable -WindowStyle Hidden | Out-Null
+        $handle = Wait-ConnectWindow -TimeoutSeconds 30
+        if ($handle -ne [IntPtr]::Zero) {
+            [void][BaleiaNativeWindow]::ShowWindowAsync($handle, 0)
+            return $true
         }
-        return ((Wait-ConnectWindow -TimeoutSeconds 30) -ne [IntPtr]::Zero)
+        return (@(Get-ConnectProcesses).Count -gt 0)
     } catch {
         Write-BaleiaLog ('Bambu Connect could not be opened: ' + $_.Exception.Message)
         return $false
@@ -745,8 +1063,14 @@ function Ensure-ConnectRunning {
 }
 
 function Show-ConnectWindow {
-    $script:TrayMode = $false
+    param([switch]$ForLogin)
     if (-not (Ensure-ConnectRunning)) { return }
+    if ($ForLogin) {
+        $script:LoginVisible = $true
+    } else {
+        $script:ManualVisible = $true
+    }
+
     $handle = Wait-ConnectWindow -TimeoutSeconds 10
     if ($handle -ne [IntPtr]::Zero) {
         [void][BaleiaNativeWindow]::ShowWindowAsync($handle, 9)
@@ -758,23 +1082,20 @@ function Hide-ConnectWindow {
     $handle = Get-ConnectWindow
     if ($handle -ne [IntPtr]::Zero) {
         [void][BaleiaNativeWindow]::ShowWindowAsync($handle, 0)
-        $script:TrayMode = $true
     }
 }
 
+function Protect-ConnectWindow {
+    if ($script:ManualVisible -or $script:LoginVisible) { return }
+    Hide-ConnectWindow
+}
+
 function Stop-Connect {
-    foreach ($process in (Get-ConnectProcesses)) {
-        try {
-            $process.Refresh()
-            if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
-                [void][BaleiaNativeWindow]::PostMessage($process.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-            } else {
-                $process.CloseMainWindow() | Out-Null
-            }
-        } catch {}
+    foreach ($process in @(Get-ConnectProcesses)) {
+        try { $process.CloseMainWindow() | Out-Null } catch {}
     }
     Start-Sleep -Milliseconds 1200
-    foreach ($process in (Get-ConnectProcesses)) {
+    foreach ($process in @(Get-ConnectProcesses)) {
         try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
     }
 }
@@ -799,10 +1120,23 @@ function Wait-MsaaDialog {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if (-not (Test-BaleiaRunning)) { return $false }
+        Protect-ConnectWindow
         $handle = Get-ConnectWindow
-        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::HasDialog($handle, $Name)) {
-            return $true
-        }
+        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::HasDialog($handle, $Name)) { return $true }
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Wait-MsaaDialogClosed {
+    param([string]$Name, [int]$TimeoutSeconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-BaleiaRunning)) { return $false }
+        Protect-ConnectWindow
+        $handle = Get-ConnectWindow
+        if ($handle -ne [IntPtr]::Zero -and -not [BaleiaMsaaBridge]::HasDialog($handle, $Name)) { return $true }
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -814,29 +1148,22 @@ function Wait-AndPressMsaaButton {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if (-not (Test-BaleiaRunning)) { return $false }
+        Protect-ConnectWindow
         $handle = Get-ConnectWindow
-        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::PressExactButton($handle, $Name)) {
-            return $true
-        }
+        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::PressExactButton($handle, $Name)) { return $true }
         Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
 }
 
 function Wait-AndPressMsaaDialogButton {
-    param(
-        [string]$DialogName,
-        [string]$ButtonName,
-        [int]$TimeoutSeconds
-    )
+    param([string]$DialogName, [string]$ButtonName, [int]$TimeoutSeconds)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if (-not (Test-BaleiaRunning)) { return $false }
+        Protect-ConnectWindow
         $handle = Get-ConnectWindow
-        if ($handle -ne [IntPtr]::Zero -and
-            [BaleiaMsaaBridge]::PressButtonInDialog($handle, $DialogName, $ButtonName)) {
-            return $true
-        }
+        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::PressButtonInDialog($handle, $DialogName, $ButtonName)) { return $true }
         Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
@@ -862,6 +1189,7 @@ function Set-MsaaPrinter {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
+        Protect-ConnectWindow
         if ([BaleiaMsaaBridge]::ChoosePrinter((Get-ConnectWindow), $PrinterName)) {
             Write-BaleiaLog ('Connect printer selected: ' + $PrinterName)
             Start-Sleep -Milliseconds 700
@@ -876,11 +1204,26 @@ function Get-ExpectedAmsSlots {
     param($Manifest)
     $slots = @()
     try {
-        foreach ($value in @($Manifest.mapping.ams)) {
-            $number = [int]$value
-            if ($number -lt 0) { $slots += 'Ext' } else { $slots += [string]($number + 1) }
+        $mapping = @($Manifest.mapping.ams)
+        $details = @($Manifest.mapping.details)
+        for ($index = 0; $index -lt $mapping.Count; $index++) {
+            $used = $true
+            if ($details.Count -gt 0) {
+                if ($index -ge $details.Count) { continue }
+                $detail = $details[$index]
+                $used = -not [string]::IsNullOrWhiteSpace([string]$detail.filamentType) -or
+                    -not [string]::IsNullOrWhiteSpace([string]$detail.filamentId) -or
+                    -not [string]::IsNullOrWhiteSpace([string]$detail.sourceColor)
+            }
+            if (-not $used) { continue }
+            $number = [int]$mapping[$index]
+            if ($number -lt 0 -or $number -ge 254) { $slots += 'Ext' }
+            else { $slots += [string]($number + 1) }
         }
-    } catch { return @() }
+    } catch {
+        Write-BaleiaLog ('Could not read filament mapping: ' + $_.Exception.Message)
+        return @()
+    }
     return @($slots)
 }
 
@@ -894,6 +1237,7 @@ function Wait-MsaaFilamentCards {
     param([int]$ExpectedCount, [int]$TimeoutSeconds = 10)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
+        Protect-ConnectWindow
         $cards = @([BaleiaMsaaBridge]::GetFilamentCards(
             (Get-ConnectWindow),
             'Send to print'))
@@ -933,6 +1277,7 @@ function Set-MsaaFilamentMapping {
         $chosen = $false
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         do {
+            Protect-ConnectWindow
             $chosen = [BaleiaMsaaBridge]::ChooseFilamentSlot(
                 (Get-ConnectWindow),
                 $wanted)
@@ -958,6 +1303,7 @@ function Set-MsaaFilamentMapping {
 
 function Set-MsaaOption {
     param([string[]]$Labels, [bool]$Enabled)
+    Protect-ConnectWindow
     $status = [BaleiaMsaaBridge]::SetOption(
         (Get-ConnectWindow),
         'Send to print',
@@ -969,125 +1315,104 @@ function Set-MsaaOption {
 
 function Invoke-ConnectPrintFlow {
     param($Manifest, [string]$GcodePath)
-
-    $returnToTray = $script:TrayMode
     $script:SendMayHaveBeenInvoked = $false
-    if (-not (Ensure-ConnectRunning)) { throw 'Bambu Connect não foi encontrado ou não abriu.' }
+    if (-not (Ensure-ConnectRunning)) { throw 'Bambu Connect nao foi encontrado ou nao abriu.' }
+    if ((Get-RawConnectionStatus) -ne 'connected') { throw 'Bambu Connect esta desconectado. Faca login antes de enviar.' }
 
-    $screenReaderWasEnabled = [BaleiaMsaaBridge]::GetScreenReaderFlag()
-    try {
-        if (-not $screenReaderWasEnabled) {
-            [BaleiaMsaaBridge]::SetScreenReaderFlag($true)
-        }
-        Start-Sleep -Milliseconds 1200
+    $encodedPath = [Uri]::EscapeDataString($GcodePath)
+    $encodedName = [Uri]::EscapeDataString([string]$Manifest.display_name)
+    $uri = 'bambu-connect://import-file?path={0}&name={1}&version=1.0.0' -f $encodedPath, $encodedName
+    # Call only the verified executable. Windows never resolves this URI through another application.
+    Start-Process -FilePath $script:ConnectExecutable -ArgumentList @($uri) -WindowStyle Hidden | Out-Null
+    $handle = Wait-ConnectWindow -TimeoutSeconds 30
+    if ($handle -eq [IntPtr]::Zero) { throw 'A janela do Bambu Connect nao foi localizada.' }
+    Protect-ConnectWindow
 
-        $encodedPath = [Uri]::EscapeDataString($GcodePath)
-        $encodedName = [Uri]::EscapeDataString([string]$Manifest.display_name)
-        $uri = 'bambu-connect://import-file?path={0}&name={1}&version=1.0.0' -f $encodedPath, $encodedName
-        Start-Process $uri | Out-Null
-
-        $handle = Wait-ConnectWindow -TimeoutSeconds 30
-        if ($handle -eq [IntPtr]::Zero) { throw 'A janela do Bambu Connect não apareceu.' }
-        if ($returnToTray) { Hide-ConnectWindow }
-
-        if (-not (Wait-AndPressMsaaDialogButton 'Import file' 'confirm' 45)) {
-            Write-MsaaSnapshot 'import confirm not found'
-            throw 'O botão de importação do Bambu Connect não foi localizado.'
-        }
-        Write-BaleiaLog ('Import accepted for ' + $Manifest.job_id)
-
-        if (-not (Wait-AndPressMsaaButton 'Print' 60)) {
-            Write-MsaaSnapshot 'page Print not found'
-            throw 'O botão Print do Bambu Connect não foi localizado.'
-        }
-        Write-BaleiaLog ('Print dialog requested for ' + $Manifest.job_id)
-
-        if (-not (Wait-MsaaDialog 'Send to print' 30)) {
-            Write-MsaaSnapshot 'Send to print dialog not found'
-            throw 'A janela final de envio do Bambu Connect não apareceu.'
-        }
-
-        $printerName = [string]$Manifest.printer.name
-        if (-not (Set-MsaaPrinter $printerName 15)) {
-            Write-MsaaSnapshot 'printer selection failed'
-            throw ('A impressora não foi selecionada no Connect: ' + $printerName)
-        }
-
-        if (-not (Set-MsaaFilamentMapping $Manifest)) {
-            Write-MsaaSnapshot 'filament mapping failed'
-            throw 'O mapeamento de filamentos não foi aplicado no Connect.'
-        }
-
-        if (-not (Set-MsaaOption @('Timelapse') ([bool]$Manifest.options.timelapse))) {
-            throw 'A opção Timelapse não foi aplicada no Connect.'
-        }
-        if (-not (Set-MsaaOption @(
-            'Flow dynamic calibration',
-            'Dynamic flow calibration',
-            'Calibracao dinamica de fluxo'
-        ) ([bool]$Manifest.options.flow_calibration))) {
-            throw 'A calibração dinâmica de fluxo não foi aplicada no Connect.'
-        }
-        if (-not (Set-MsaaOption @(
-            'Bed leveling',
-            'Nivelamento da mesa',
-            'Nivelamento automatico'
-        ) ([bool]$Manifest.options.bed_leveling))) {
-            throw 'O nivelamento da mesa não foi aplicado no Connect.'
-        }
-
-        # The final button is invoked exactly once. There is deliberately no
-        # retry after this point: Connect owns validation and transport.
-        $script:SendMayHaveBeenInvoked = $true
-        if (-not [BaleiaMsaaBridge]::PressButtonInDialog(
-            (Get-ConnectWindow),
-            'Send to print',
-            'confirm')) {
-            Write-MsaaSnapshot 'final confirm result uncertain'
-            throw 'O estado do envio ficou incerto. Confira o Connect antes de repetir.'
-        }
-        Write-BaleiaLog ('Send invoked once for ' + $Manifest.job_id + ' on ' + $printerName)
-
-        if ($returnToTray) { Hide-ConnectWindow }
-    } finally {
-        if (-not $screenReaderWasEnabled) {
-            try { [BaleiaMsaaBridge]::SetScreenReaderFlag($false) } catch {}
-        }
+    if (-not (Wait-AndPressMsaaDialogButton 'Import file' 'confirm' 45)) {
+        Write-MsaaSnapshot 'import confirm not found'
+        throw 'O botao de importacao do Bambu Connect nao foi localizado.'
     }
+    if (-not (Wait-MsaaDialogClosed 'Import file' 20)) {
+        Write-MsaaSnapshot 'import dialog did not close'
+        throw 'O Bambu Connect nao concluiu a importacao do arquivo.'
+    }
+    Write-BaleiaLog ('Import accepted for ' + $Manifest.job_id)
+
+    if (-not (Wait-AndPressMsaaButton 'Print' 60)) {
+        Write-MsaaSnapshot 'page Print not found'
+        throw 'O botao Print do Bambu Connect nao foi localizado.'
+    }
+    Write-BaleiaLog ('Print dialog requested for ' + $Manifest.job_id)
+    if (-not (Wait-MsaaDialog 'Send to print' 30)) {
+        Write-MsaaSnapshot 'Send to print dialog not found'
+        throw 'A janela final de envio do Bambu Connect nao apareceu.'
+    }
+    Protect-ConnectWindow
+
+    $printerName = [string]$Manifest.printer.name
+    if (-not (Set-MsaaPrinter $printerName 15)) {
+        Write-MsaaSnapshot 'printer selection failed'
+        throw ('A impressora nao foi selecionada no Connect: ' + $printerName)
+    }
+    if (-not (Set-MsaaFilamentMapping $Manifest)) {
+        Write-MsaaSnapshot 'filament mapping failed'
+        throw 'O mapeamento de filamentos nao foi aplicado no Connect.'
+    }
+    if (-not (Set-MsaaOption @('Timelapse') ([bool]$Manifest.options.timelapse))) { throw 'A opcao Timelapse nao foi aplicada no Connect.' }
+    if (-not (Set-MsaaOption @('Flow dynamic calibration','Dynamic flow calibration','Calibracao dinamica de fluxo') ([bool]$Manifest.options.flow_calibration))) { throw 'A calibracao dinamica de fluxo nao foi aplicada no Connect.' }
+    if (-not (Set-MsaaOption @('Bed leveling','Nivelamento da mesa','Nivelamento automatico') ([bool]$Manifest.options.bed_leveling))) { throw 'O nivelamento da mesa nao foi aplicado no Connect.' }
+    if ((Get-RawConnectionStatus) -ne 'connected') { throw 'Bambu Connect desconectou antes do envio. Faca login e tente novamente.' }
+
+    # The final Send has exactly one attempt and never retries.
+    $handle = Get-ConnectWindow
+    if ($handle -eq [IntPtr]::Zero) { throw 'A janela do Bambu Connect desapareceu antes do envio.' }
+    $script:SendMayHaveBeenInvoked = $true
+    if (-not [BaleiaMsaaBridge]::PressButtonInDialog($handle, 'Send to print', 'confirm')) {
+        Write-MsaaSnapshot 'final Send unavailable'
+        throw 'O botao Send nao esta disponivel. Verifique se a impressora esta ocupada.'
+    }
+    Write-BaleiaLog ('Send invoked exactly once for ' + $Manifest.job_id + ' on ' + $printerName)
+    if (-not (Wait-MsaaDialogClosed 'Send to print' 45)) {
+        $script:QueueBlocked = $true
+        Write-MsaaSnapshot 'final Send result uncertain'
+        throw 'O estado do envio ficou incerto. Confira a impressora antes de repetir.'
+    }
+    Protect-ConnectWindow
 }
 
 function Move-JobToError {
     param([string]$ManifestPath, [string]$GcodePath, [string]$Message)
     if ($script:SendMayHaveBeenInvoked) {
-        $Message = 'ATENÇÃO: o Send pode ter sido acionado. Confira o Connect e a impressora antes de repetir. ' + $Message
+        $script:QueueBlocked = $true
+        $Message = 'ATENCAO: o Send pode ter sido acionado. Nao repita este trabalho. ' + $Message
     }
     try {
-        $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileNameWithoutExtension($ManifestPath))
-        $targetManifest = Join-Path $script:ErrorDir ([IO.Path]::GetFileName($ManifestPath))
-        Move-Item -LiteralPath $ManifestPath -Destination $targetManifest -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $GcodePath) {
-            Copy-Item -LiteralPath $GcodePath -Destination (Join-Path $script:ErrorDir ([IO.Path]::GetFileName($GcodePath))) -Force -ErrorAction SilentlyContinue
+        $manifestName = [IO.Path]::GetFileName($ManifestPath)
+        $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileNameWithoutExtension($manifestName))
+        if (Test-Path -LiteralPath $ManifestPath) {
+            Move-Item -LiteralPath $ManifestPath -Destination (Join-Path $script:ErrorDir $manifestName) -Force -ErrorAction SilentlyContinue
+        }
+        if ($GcodePath -and (Test-Path -LiteralPath $GcodePath)) {
+            Move-Item -LiteralPath $GcodePath -Destination (Join-Path $script:ErrorDir ([IO.Path]::GetFileName($GcodePath))) -Force -ErrorAction SilentlyContinue
         }
         Set-Content -LiteralPath (Join-Path $script:ErrorDir ($baseName + '.error.txt')) -Value $Message -Encoding UTF8
     } catch {}
     Write-BaleiaLog ('Job stopped safely: ' + $Message)
-    if ($script:NotifyIcon) {
-        $script:NotifyIcon.BalloonTipTitle = 'Baleia Connect'
-        $script:NotifyIcon.BalloonTipText = $Message
-        $script:NotifyIcon.ShowBalloonTip(8000)
+    Show-StatusToast 'Falha no envio. Veja a pasta Erros.' $false
+    if (-not $script:SendMayHaveBeenInvoked -and (Test-BaleiaRunning)) {
+        Stop-Connect
+        Start-Sleep -Milliseconds 500
+        [void](Ensure-ConnectRunning)
+        Protect-ConnectWindow
     }
-    Show-ConnectWindow
 }
 
 function Process-NextJob {
-    $next = Get-ChildItem -LiteralPath $script:PendingDir -Filter '*.job.json' -File -ErrorAction SilentlyContinue |
-        Sort-Object CreationTimeUtc | Select-Object -First 1
+    if ($script:QueueBlocked -or $script:ConnectionStatus -ne 'connected') { return }
+    $next = @(Get-ChildItem -LiteralPath $script:PendingDir -Filter '*.job.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc) | Select-Object -First 1
     if (-not $next) { return }
-
     $workingManifest = Join-Path $script:WorkingDir $next.Name
-    try {
-        Move-Item -LiteralPath $next.FullName -Destination $workingManifest -ErrorAction Stop
-    } catch { return }
+    try { Move-Item -LiteralPath $next.FullName -Destination $workingManifest -ErrorAction Stop } catch { return }
 
     $gcodePath = ''
     try {
@@ -1096,18 +1421,34 @@ function Process-NextJob {
         if (-not (Test-Path -LiteralPath $sourceGcode)) { throw 'O arquivo G-code 3MF da fila desapareceu.' }
         $gcodePath = Join-Path $script:WorkingDir ([IO.Path]::GetFileName($sourceGcode))
         Move-Item -LiteralPath $sourceGcode -Destination $gcodePath -ErrorAction Stop
-
         Write-BaleiaLog ('Processing ' + $manifest.job_id + ' for ' + $manifest.printer.name)
         Invoke-ConnectPrintFlow $manifest $gcodePath
-
         Remove-Item -LiteralPath $gcodePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $workingManifest -Force -ErrorAction SilentlyContinue
         Write-BaleiaLog ('Completed ' + $manifest.job_id)
     } catch {
-        if (Test-BaleiaRunning) {
-            Move-JobToError $workingManifest $gcodePath $_.Exception.Message
-        }
+        if (Test-BaleiaRunning) { Move-JobToError $workingManifest $gcodePath $_.Exception.Message }
     }
+}
+
+function Recover-InterruptedJobs {
+    $interrupted = @(Get-ChildItem -LiteralPath $script:WorkingDir -Filter '*.job.json' -File -ErrorAction SilentlyContinue)
+    if ($interrupted.Count -eq 0) { return }
+    foreach ($manifest in $interrupted) {
+        $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileNameWithoutExtension($manifest.Name))
+        $gcodePath = Join-Path $script:WorkingDir ($baseName + '.gcode.3mf')
+        $message = 'Trabalho interrompido antes da confirmacao do resultado. Confira a impressora antes de repetir.'
+        try {
+            Move-Item -LiteralPath $manifest.FullName -Destination (Join-Path $script:ErrorDir $manifest.Name) -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $gcodePath) {
+                Move-Item -LiteralPath $gcodePath -Destination (Join-Path $script:ErrorDir ([IO.Path]::GetFileName($gcodePath))) -Force -ErrorAction SilentlyContinue
+            }
+            Set-Content -LiteralPath (Join-Path $script:ErrorDir ($baseName + '.error.txt')) -Value $message -Encoding UTF8
+        } catch {}
+    }
+    $script:QueueBlocked = $true
+    Write-BaleiaLog 'Interrupted jobs moved to Erros; queue blocked for this session.'
+    Show-StatusToast 'Fila pausada. Confira a pasta Erros.' $false
 }
 
 function Remove-StaleFiles {
@@ -1126,6 +1467,7 @@ if (-not $createdNew) { exit 0 }
 
 try {
     $script:ConnectExecutable = Find-ConnectExecutable
+    Write-ConnectionStatusFile 'checking' -Force
 
     $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
     if ($script:ConnectExecutable) {
@@ -1144,31 +1486,64 @@ try {
     $script:NotifyIcon.add_DoubleClick({ Show-ConnectWindow })
 
     Write-BaleiaLog ('Helper started for Baleia PID ' + $ParentPid)
-    [void](Ensure-ConnectRunning)
-    $lastCleanup = [DateTime]::MinValue
+    Recover-InterruptedJobs
 
+    if (-not $script:ConnectExecutable) {
+        Set-ConnectionStatus 'missing'
+    } else {
+        $script:ScreenReaderWasEnabled = [BaleiaMsaaBridge]::GetScreenReaderFlag()
+        if (-not $script:ScreenReaderWasEnabled) {
+            [BaleiaMsaaBridge]::SetScreenReaderFlag($true)
+            $script:ScreenReaderChanged = $true
+        }
+        if (-not (Ensure-ConnectRunning)) {
+            Set-ConnectionStatus 'error'
+        } else {
+            Protect-ConnectWindow
+        }
+    }
+
+    $lastStatusCheck = [DateTime]::MinValue
+    $lastCleanup = [DateTime]::MinValue
     while (-not $script:StopRequested) {
         if (-not (Test-BaleiaRunning)) { break }
 
-        $handle = Get-ConnectWindow
-        if ($handle -ne [IntPtr]::Zero -and [BaleiaNativeWindow]::IsIconic($handle)) {
-            Hide-ConnectWindow
-        } elseif ($script:TrayMode -and $handle -ne [IntPtr]::Zero) {
-            [void][BaleiaNativeWindow]::ShowWindowAsync($handle, 0)
+        if (([DateTime]::UtcNow - $lastStatusCheck).TotalSeconds -ge 2) {
+            Update-ConnectionStatus
+            $lastStatusCheck = [DateTime]::UtcNow
         }
 
+        $handle = Get-ConnectWindow
+        if ($handle -eq [IntPtr]::Zero) {
+            $script:ManualVisible = $false
+            $script:LoginVisible = $false
+        } else {
+            $minimized = [BaleiaNativeWindow]::IsIconic($handle)
+            $visible = [BaleiaNativeWindow]::IsWindowVisible($handle)
+            if (($script:ManualVisible -or $script:LoginVisible) -and ($minimized -or -not $visible)) {
+                $script:ManualVisible = $false
+                $script:LoginVisible = $false
+                Hide-ConnectWindow
+            }
+        }
+
+        Protect-ConnectWindow
         Process-NextJob
         if (([DateTime]::UtcNow - $lastCleanup).TotalMinutes -ge 15) {
             Remove-StaleFiles
             $lastCleanup = [DateTime]::UtcNow
         }
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 350
+        Start-Sleep -Milliseconds 250
     }
 } catch {
     Write-BaleiaLog ('Fatal helper error: ' + $_.Exception.Message)
+    Set-ConnectionStatus 'error'
 } finally {
     Write-BaleiaLog 'Helper stopping with Baleia.'
+    if ($script:ScreenReaderChanged) {
+        try { [BaleiaMsaaBridge]::SetScreenReaderFlag($script:ScreenReaderWasEnabled) } catch {}
+    }
     Stop-Connect
     if ($script:NotifyIcon) {
         $script:NotifyIcon.Visible = $false

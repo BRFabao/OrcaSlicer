@@ -28,6 +28,19 @@ struct BaleiaConnectJob
 
 namespace BaleiaConnect {
 
+enum class ConnectionStatus
+{
+    Checking,
+    Connected,
+    Disconnected,
+    Missing,
+    Error
+};
+
+// Reads the heartbeat written by the hidden Connect companion. A stale or
+// not-yet-created heartbeat is Checking, never optimistically Connected.
+ConnectionStatus connection_status();
+
 // Enables the portable data_dir shipped with Baleia. On its first run, the
 // existing OrcaSlicer profile is copied into it. If the live directory was
 // lost, the latest complete Baleia backup is restored instead.

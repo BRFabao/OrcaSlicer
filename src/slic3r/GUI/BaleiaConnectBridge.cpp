@@ -196,11 +196,71 @@ std::string path_utf8(const fs::path &path)
 #endif
 }
 
+bool has_job_manifest(const fs::path &directory)
+{
+    boost::system::error_code ec;
+    if (!fs::is_directory(directory, ec))
+        return false;
+
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
+        const fs::path candidate = it->path();
+        if (fs::is_regular_file(candidate, ec) &&
+            boost::algorithm::iends_with(candidate.filename().string(), ".job.json"))
+            return true;
+        ec.clear();
+    }
+    return false;
+}
+
+bool has_active_job(const fs::path &bridge_root)
+{
+    return has_job_manifest(bridge_root / "Fila") ||
+           has_job_manifest(bridge_root / "Processando");
+}
+
 } // namespace
 
 fs::path application_root()
 {
     return fs::path(wxStandardPaths::Get().GetExecutablePath().ToUTF8().data()).parent_path();
+}
+
+ConnectionStatus connection_status()
+{
+#ifndef _WIN32
+    return ConnectionStatus::Missing;
+#else
+    try {
+        const fs::path status_file = queue_root(application_root()) / "Runtime" / "connect.status";
+        boost::system::error_code ec;
+        if (!fs::is_regular_file(status_file, ec))
+            return ConnectionStatus::Checking;
+
+        const std::time_t modified = fs::last_write_time(status_file, ec);
+        if (ec)
+            return ConnectionStatus::Checking;
+        const std::time_t now = std::time(nullptr);
+        if (modified > now || now - modified > 15)
+            return ConnectionStatus::Checking;
+
+        boost::nowide::ifstream stream(path_utf8(status_file), std::ios::binary);
+        std::string status;
+        stream >> status;
+        if (!stream && status.empty())
+            return ConnectionStatus::Checking;
+        if (status == "connected")
+            return ConnectionStatus::Connected;
+        if (status == "disconnected")
+            return ConnectionStatus::Disconnected;
+        if (status == "missing")
+            return ConnectionStatus::Missing;
+        if (status == "error")
+            return ConnectionStatus::Error;
+        return ConnectionStatus::Checking;
+    } catch (...) {
+        return ConnectionStatus::Error;
+    }
+#endif
 }
 
 bool prepare_portable_data_directory(const fs::path &root, const fs::path &legacy_data_directory)
@@ -318,6 +378,22 @@ bool queue_job(const BaleiaConnectJob &job, std::string *error_message)
         cleanup_stale_queue_files(bridge_root / "Fila");
         cleanup_stale_queue_files(bridge_root / "Processando");
         cleanup_stale_queue_files(bridge_root / "Erros");
+
+        switch (connection_status()) {
+        case ConnectionStatus::Connected:
+            break;
+        case ConnectionStatus::Disconnected:
+            return fail("Bambu Connect esta desconectado. Faca login antes de enviar.");
+        case ConnectionStatus::Missing:
+            return fail("Bambu Connect nao foi encontrado.");
+        case ConnectionStatus::Error:
+            return fail("Bambu Connect apresentou um erro. Reinicie a Baleia.");
+        case ConnectionStatus::Checking:
+        default:
+            return fail("A Baleia ainda esta verificando a conexao com Bambu Connect.");
+        }
+        if (has_active_job(bridge_root))
+            return fail("Ja existe um envio da Baleia em andamento.");
 
         const std::string job_id = utc_timestamp("%Y%m%dT%H%M%SZ-") + fs::unique_path("%%%%-%%%%-%%%%").string();
         const fs::path file_path = pending / (job_id + ".gcode.3mf");

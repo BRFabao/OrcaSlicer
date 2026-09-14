@@ -1,30 +1,56 @@
-name: Build Orca 2.4.2 with Bambu Connect (Windows x64)
+name: Build Baleia Orca VR004 (Windows x64)
 
 on:
   push:
     branches:
-      - fabao/orca-2.4.2-bambu-connect
       - fabao/baleia-vr002-connect-automation
   workflow_dispatch:
 
 jobs:
   check_baleia_helper:
-    name: Check Baleia Connect helper
+    name: Validate Baleia VR004 helper
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Parse helper and compile its MSAA bridge
+      - name: Validate safety rules and compile MSAA bridge
         shell: pwsh
         run: |
           $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'resources\baleia\BaleiaConnectHelper.ps1'
+          $content = [IO.File]::ReadAllText($scriptPath)
+          $forbidden = @(
+            'MainWindowTitle -like',
+            'ProcessName -match',
+            'Start-Process $uri'
+          )
+          foreach ($pattern in $forbidden) {
+            if ($content.Contains($pattern)) { throw "Forbidden helper selector: $pattern" }
+          }
+          if ($content -match '(?i)\b(chrome|msedge|firefox|browser)\b') {
+            throw 'The helper must never select or name a browser process.'
+          }
+          if ($content -notmatch 'Test-ConnectExecutablePath' -or
+              $content -notmatch '\[IO\.Path\]::GetFullPath\(\$process\.Path\)' -or
+              $content -notmatch 'Start-Process -FilePath \$script:ConnectExecutable -ArgumentList') {
+            throw 'Exact executable-path protection is missing.'
+          }
+          if ($content -notmatch "Show-StatusToast 'Conectado'" -or
+              $content -notmatch "Show-StatusToast 'Desconectado'") {
+            throw 'Connected/disconnected status toasts are missing.'
+          }
+          $sendText = 'PressButtonInDialog($handle, ''Send to print'', ''confirm'')'
+          if (([regex]::Matches($content, [regex]::Escape($sendText))).Count -ne 1) {
+            throw 'The final Send action must exist exactly once.'
+          }
+          $nonAscii = $content.ToCharArray() | Where-Object { [int]$_ -gt 127 } | Select-Object -First 1
+          if ($null -ne $nonAscii) { throw 'The PowerShell helper must contain ASCII only.' }
           & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
             -File $scriptPath -ParentPid $PID -Root $env:RUNNER_TEMP -CompileOnly
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   build_windows_x64:
-    name: Build Windows x64 portable
+    name: Build Baleia Orca VR004 portable
     needs: check_baleia_helper
     uses: ./.github/workflows/build_check_cache.yml
     with:

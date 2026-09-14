@@ -55,6 +55,25 @@ wxDEFINE_EVENT(EVT_CLEAR_IPADDRESS, wxCommandEvent);
 
 static wxString task_canceled_text = _L("Task canceled");
 
+#ifdef _WIN32
+static wxString baleia_connect_status_message(BaleiaConnect::ConnectionStatus status)
+{
+    switch (status) {
+    case BaleiaConnect::ConnectionStatus::Disconnected:
+        return wxString::FromUTF8("Bambu Connect desconectado. Faca login no Connect para enviar.");
+    case BaleiaConnect::ConnectionStatus::Missing:
+        return wxString::FromUTF8("Bambu Connect nao foi encontrado.");
+    case BaleiaConnect::ConnectionStatus::Error:
+        return wxString::FromUTF8("Erro no Bambu Connect. Reinicie a Baleia.");
+    case BaleiaConnect::ConnectionStatus::Checking:
+        return wxString::FromUTF8("Verificando a conexao com Bambu Connect.");
+    case BaleiaConnect::ConnectionStatus::Connected:
+        return wxEmptyString;
+    }
+    return wxString::FromUTF8("Verificando a conexao com Bambu Connect.");
+}
+#endif
+
 std::string get_nozzle_volume_type_cloud_string(NozzleVolumeType nozzle_volume_type)
 {
     if (nozzle_volume_type == NozzleVolumeType::nvtStandard) {
@@ -2400,8 +2419,22 @@ void SelectMachineDialog::on_send_print()
     if (!dev) return;
 
     MachineObject* obj_ = dev->get_selected_machine();
-    assert(obj_->get_dev_id() == m_printer_last_select);
     if (obj_ == nullptr) { return; }
+    assert(obj_->get_dev_id() == m_printer_last_select);
+
+#ifdef _WIN32
+    const bool route_through_bambu_connect =
+        m_print_type == PrintFromType::FROM_NORMAL && wxGetApp().preset_bundle &&
+        wxGetApp().preset_bundle->is_bbl_vendor();
+    if (route_through_bambu_connect) {
+        const BaleiaConnect::ConnectionStatus connect_status = BaleiaConnect::connection_status();
+        if (connect_status != BaleiaConnect::ConnectionStatus::Connected) {
+            show_status(PrintDialogStatus::PrintStatusNoUserLogin,
+                        {baleia_connect_status_message(connect_status)});
+            return;
+        }
+    }
+#endif
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", print_job: for send task, current printer id =  " << m_printer_last_select << std::endl;
     show_status(PrintDialogStatus::PrintStatusSending);
@@ -2576,9 +2609,6 @@ void SelectMachineDialog::on_send_print()
     // upstream validation and final choice made by this dialog, but hand the
     // completed package to the local Baleia queue before the blocked network
     // job is created. Other printer vendors continue through the original path.
-    const bool route_through_bambu_connect =
-        m_print_type == PrintFromType::FROM_NORMAL && wxGetApp().preset_bundle &&
-        wxGetApp().preset_bundle->is_bbl_vendor();
     if (route_through_bambu_connect) {
         PrintPrepareData print_data;
         m_plater->get_print_job_data(&print_data);
@@ -3658,6 +3688,22 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
 
     // check extension tool warning
     UpdateStatusCheckWarning_ExtensionTool(obj_);
+
+#ifdef _WIN32
+    // Keep all upstream printer checks above this point. In particular, an
+    // occupied printer retains the original busy warning and disabled button.
+    const bool route_through_bambu_connect =
+        m_print_type == PrintFromType::FROM_NORMAL && wxGetApp().preset_bundle &&
+        wxGetApp().preset_bundle->is_bbl_vendor();
+    if (route_through_bambu_connect) {
+        const BaleiaConnect::ConnectionStatus connect_status = BaleiaConnect::connection_status();
+        if (connect_status != BaleiaConnect::ConnectionStatus::Connected) {
+            show_status(PrintDialogStatus::PrintStatusNoUserLogin,
+                        {baleia_connect_status_message(connect_status)});
+            return;
+        }
+    }
+#endif
 
     /** normal check **/
     show_status(PrintDialogStatus::PrintStatusReadyToGo);
