@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fabao/orca-2.4.2-bambu-connect
+      - fabao/baleia-vr002-connect-automation
   workflow_dispatch:
 
 jobs:
