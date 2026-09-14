@@ -7,8 +7,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  check_baleia_helper:
+    name: Check Baleia Connect helper
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Parse helper and compile its MSAA bridge
+        shell: pwsh
+        run: |
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'resources\baleia\BaleiaConnectHelper.ps1'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $scriptPath -ParentPid $PID -Root $env:RUNNER_TEMP -CompileOnly
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   build_windows_x64:
     name: Build Windows x64 portable
+    needs: check_baleia_helper
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: windows-latest

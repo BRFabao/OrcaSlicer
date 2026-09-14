@@ -8,9 +8,13 @@ Esta integração mantém o fatiador e o transporte autenticado separados.
    montar as escolhas físicas de impressora e AMS.
 2. Para presets Bambu no Windows, `BaleiaConnectBridge` copia o pacote para
    `BaleiaConnect/Fila` e publica um manifesto JSON de modo atômico.
-3. `BaleiaConnectHelper.ps1` importa o pacote no Bambu Connect e aciona os
-   controles acessíveis `Import` e `Print` uma única vez.
-4. Para outros fabricantes, o caminho original do Orca continua intacto.
+3. `BaleiaConnectHelper.ps1` usa a árvore MSAA do próprio Bambu Connect, sem
+   coordenadas ou foco fixo: confirma `Import file`, aciona `Print`, aplica a
+   impressora, o mapeamento e as três opções guardadas no manifesto.
+4. No diálogo `Send to print`, o helper aciona o botão acessível `confirm`
+   exatamente uma vez. Validações e transporte continuam pertencendo ao
+   Bambu Connect.
+5. Para outros fabricantes, o caminho original do Orca continua intacto.
 
 Trabalhos reivindicados são movidos para `Processando`. Eles nunca voltam
 automaticamente para a fila, evitando impressão duplicada depois de uma queda.

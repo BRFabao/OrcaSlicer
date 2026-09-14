@@ -3,7 +3,9 @@ param(
     [int]$ParentPid,
 
     [Parameter(Mandatory = $true)]
-    [string]$Root
+    [string]$Root,
+
+    [switch]$CompileOnly
 )
 
 Set-StrictMode -Version 2.0
@@ -11,8 +13,7 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName Accessibility
 
 Add-Type @'
 using System;
@@ -34,6 +35,592 @@ public static class BaleiaNativeWindow
 }
 '@
 
+if (-not ('BaleiaMsaaBridge' -as [type])) {
+    $msaaSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using Accessibility;
+
+public static class BaleiaMsaaBridge
+{
+    private const uint OBJID_CLIENT = 0xFFFFFFFC;
+    private const uint SPI_GETSCREENREADER = 0x0046;
+    private const uint SPI_SETSCREENREADER = 0x0047;
+    private const uint SPIF_SENDCHANGE = 0x0002;
+
+    private const int ROLE_SYSTEM_DIALOG = 0x12;
+    private const int ROLE_SYSTEM_GROUPING = 0x14;
+    private const int ROLE_SYSTEM_MENUPOPUP = 0x0B;
+    private const int ROLE_SYSTEM_MENUITEM = 0x0C;
+    private const int ROLE_SYSTEM_LIST = 0x21;
+    private const int ROLE_SYSTEM_LISTITEM = 0x22;
+    private const int ROLE_SYSTEM_OUTLINE = 0x23;
+    private const int ROLE_SYSTEM_PUSHBUTTON = 0x2B;
+    private const int ROLE_SYSTEM_RADIOBUTTON = 0x2D;
+    private const int ROLE_SYSTEM_COMBOBOX = 0x2E;
+    private const int ROLE_SYSTEM_DROPLIST = 0x2F;
+
+    private const int STATE_SYSTEM_UNAVAILABLE = 0x00000001;
+    private const int STATE_SYSTEM_CHECKED = 0x00000010;
+    private const int MaxDepth = 40;
+    private const int MaxChildren = 10000;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    private sealed class Entry
+    {
+        public IAccessible Owner;
+        public int ChildId;
+        public string Name;
+        public string Action;
+        public int Role;
+        public int State;
+        public bool InChoiceContainer;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(
+        IntPtr hWndParent,
+        EnumWindowsProc lpEnumFunc,
+        IntPtr lParam);
+
+    [DllImport("oleacc.dll", PreserveSig = true)]
+    private static extern int AccessibleObjectFromWindow(
+        IntPtr hwnd,
+        uint dwObjectID,
+        ref Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out IAccessible ppvObject);
+
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SystemParametersInfoGet(
+        uint uiAction,
+        uint uiParam,
+        ref int pvParam,
+        uint fWinIni);
+
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SystemParametersInfoSet(
+        uint uiAction,
+        uint uiParam,
+        IntPtr pvParam,
+        uint fWinIni);
+
+    public static bool GetScreenReaderFlag()
+    {
+        int value = 0;
+        if (!SystemParametersInfoGet(SPI_GETSCREENREADER, 0, ref value, 0))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return value != 0;
+    }
+
+    public static void SetScreenReaderFlag(bool enabled)
+    {
+        if (!SystemParametersInfoSet(
+            SPI_SETSCREENREADER,
+            enabled ? 1u : 0u,
+            IntPtr.Zero,
+            SPIF_SENDCHANGE))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static bool HasDialog(IntPtr topWindow, string dialogName)
+    {
+        return FindDialog(topWindow, dialogName) != null;
+    }
+
+    public static bool PressExactButton(IntPtr topWindow, string buttonName)
+    {
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            foreach (Entry entry in Flatten(root))
+            {
+                if (entry.Role == ROLE_SYSTEM_PUSHBUTTON &&
+                    EqualName(entry.Name, buttonName) &&
+                    Invoke(entry))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    public static bool PressButtonInDialog(
+        IntPtr topWindow,
+        string dialogName,
+        string buttonName)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return false;
+
+        foreach (Entry entry in Flatten(dialog))
+        {
+            if (entry.Role == ROLE_SYSTEM_PUSHBUTTON &&
+                EqualName(entry.Name, buttonName) &&
+                Invoke(entry))
+                return true;
+        }
+        return false;
+    }
+
+    public static string OpenPrinterPicker(
+        IntPtr topWindow,
+        string dialogName,
+        string printerName)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return "missing-dialog";
+
+        foreach (Entry entry in Flatten(dialog))
+        {
+            if (entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+            if (String.IsNullOrWhiteSpace(entry.Action))
+                continue;
+            if (!String.IsNullOrWhiteSpace(printerName) &&
+                entry.Name.IndexOf(printerName.Trim(), StringComparison.OrdinalIgnoreCase) >= 0)
+                return "already-selected";
+            return Invoke(entry) ? "opened" : "invoke-failed";
+        }
+        return "missing-selector";
+    }
+
+    public static bool ChoosePrinter(IntPtr topWindow, string printerName)
+    {
+        Entry best = null;
+        int bestRank = Int32.MaxValue;
+
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            foreach (Entry entry in Flatten(root))
+            {
+                if (!ChoiceNameMatches(entry.Name, printerName) ||
+                    entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) >= 0)
+                    continue;
+
+                int rank = ChoiceRank(entry);
+                if (rank < bestRank)
+                {
+                    best = entry;
+                    bestRank = rank;
+                }
+            }
+        }
+
+        return best != null && bestRank <= 1 && Invoke(best);
+    }
+
+    public static string[] GetFilamentCards(IntPtr topWindow, string dialogName)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return new string[0];
+
+        List<Entry> cards = FilamentCards(dialog);
+        List<string> names = new List<string>();
+        foreach (Entry card in cards) names.Add(card.Name);
+        return names.ToArray();
+    }
+
+    public static bool OpenFilamentCard(
+        IntPtr topWindow,
+        string dialogName,
+        int cardIndex)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return false;
+
+        List<Entry> cards = FilamentCards(dialog);
+        return cardIndex >= 0 && cardIndex < cards.Count && Invoke(cards[cardIndex]);
+    }
+
+    public static bool ChooseFilamentSlot(IntPtr topWindow, string slot)
+    {
+        Entry best = null;
+        int bestRank = Int32.MaxValue;
+
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            foreach (Entry entry in Flatten(root))
+            {
+                if (!SlotNameMatches(entry.Name, slot)) continue;
+                int rank = ChoiceRank(entry);
+                if (rank < bestRank)
+                {
+                    best = entry;
+                    bestRank = rank;
+                }
+            }
+        }
+
+        // A filament card is also clickable, so only accept a real menu/list
+        // choice. This prevents changing the wrong model filament by accident.
+        return best != null && bestRank <= 1 && Invoke(best);
+    }
+
+    public static string SetOption(
+        IntPtr topWindow,
+        string dialogName,
+        string[] labelNames,
+        bool enabled)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return "missing-dialog";
+
+        List<Entry> entries = Flatten(dialog);
+        int labelIndex = -1;
+        for (int index = 0; index < entries.Count; index++)
+        {
+            if (AnyEqual(entries[index].Name, labelNames))
+            {
+                labelIndex = index;
+                break;
+            }
+        }
+        if (labelIndex < 0) return "missing-label";
+
+        string desired = enabled ? "On" : "Off";
+        for (int index = labelIndex + 1; index < entries.Count; index++)
+        {
+            Entry entry = entries[index];
+            if (IsOptionLabel(entry.Name)) break;
+            if (entry.Role != ROLE_SYSTEM_RADIOBUTTON || !EqualName(entry.Name, desired))
+                continue;
+            if (IsSelected(entry)) return "already-selected";
+            return Invoke(entry) ? "selected" : "invoke-failed";
+        }
+        return "missing-choice";
+    }
+
+    public static string[] Dump(IntPtr topWindow)
+    {
+        List<string> lines = new List<string>();
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            foreach (Entry entry in Flatten(root))
+            {
+                if (String.IsNullOrWhiteSpace(entry.Name) &&
+                    String.IsNullOrWhiteSpace(entry.Action))
+                    continue;
+                lines.Add(String.Format(
+                    "role={0} | name={1} | action={2} | state=0x{3:X}",
+                    entry.Role,
+                    Clean(entry.Name),
+                    Clean(entry.Action),
+                    entry.State));
+                if (lines.Count >= MaxChildren) return lines.ToArray();
+            }
+        }
+        return lines.ToArray();
+    }
+
+    private static IAccessible FindDialog(IntPtr topWindow, string dialogName)
+    {
+        foreach (IAccessible root in Roots(topWindow))
+        {
+            HashSet<long> seen = new HashSet<long>();
+            IAccessible found = FindDialogRecursive(root, dialogName, 0, seen);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static IAccessible FindDialogRecursive(
+        IAccessible accessible,
+        string dialogName,
+        int depth,
+        HashSet<long> seen)
+    {
+        if (accessible == null || depth > MaxDepth) return null;
+        long identity = ComIdentity(accessible);
+        if (identity != 0 && !seen.Add(identity)) return null;
+
+        Entry self = MakeEntry(accessible, 0, false);
+        if (self.Role == ROLE_SYSTEM_DIALOG && EqualName(self.Name, dialogName))
+            return accessible;
+
+        int childCount = SafeChildCount(accessible);
+        for (int childId = 1; childId <= childCount; childId++)
+        {
+            object child = null;
+            try { child = accessible.get_accChild(childId); }
+            catch { }
+            IAccessible childAccessible = child as IAccessible;
+            if (childAccessible == null) continue;
+            IAccessible found = FindDialogRecursive(
+                childAccessible,
+                dialogName,
+                depth + 1,
+                seen);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static List<IAccessible> Roots(IntPtr topWindow)
+    {
+        List<IntPtr> windows = new List<IntPtr>();
+        windows.Add(topWindow);
+        EnumWindowsProc callback = delegate(IntPtr child, IntPtr unused)
+        {
+            windows.Add(child);
+            return true;
+        };
+        EnumChildWindows(topWindow, callback, IntPtr.Zero);
+
+        List<IAccessible> roots = new List<IAccessible>();
+        foreach (IntPtr window in windows)
+        {
+            IAccessible accessible;
+            Guid iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+            int result = AccessibleObjectFromWindow(
+                window,
+                OBJID_CLIENT,
+                ref iid,
+                out accessible);
+            if (result >= 0 && accessible != null) roots.Add(accessible);
+        }
+        return roots;
+    }
+
+    private static List<Entry> Flatten(IAccessible root)
+    {
+        List<Entry> entries = new List<Entry>();
+        HashSet<long> seen = new HashSet<long>();
+        Walk(root, 0, false, entries, seen);
+        return entries;
+    }
+
+    private static void Walk(
+        IAccessible accessible,
+        int depth,
+        bool inChoiceContainer,
+        List<Entry> entries,
+        HashSet<long> seen)
+    {
+        if (accessible == null || depth > MaxDepth || entries.Count >= MaxChildren) return;
+        long identity = ComIdentity(accessible);
+        if (identity != 0 && !seen.Add(identity)) return;
+
+        Entry self = MakeEntry(accessible, 0, inChoiceContainer);
+        entries.Add(self);
+        bool childInChoice = inChoiceContainer || IsChoiceContainer(self.Role);
+
+        int childCount = SafeChildCount(accessible);
+        for (int childId = 1; childId <= childCount; childId++)
+        {
+            object child = null;
+            try { child = accessible.get_accChild(childId); }
+            catch { }
+
+            IAccessible childAccessible = child as IAccessible;
+            if (childAccessible != null)
+            {
+                Walk(childAccessible, depth + 1, childInChoice, entries, seen);
+            }
+            else
+            {
+                entries.Add(MakeEntry(accessible, childId, childInChoice));
+            }
+            if (entries.Count >= MaxChildren) return;
+        }
+    }
+
+    private static List<Entry> FilamentCards(IAccessible dialog)
+    {
+        List<Entry> entries = Flatten(dialog);
+        List<Entry> cards = new List<Entry>();
+        bool afterPrinter = false;
+
+        foreach (Entry entry in entries)
+        {
+            if (entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                afterPrinter = true;
+                continue;
+            }
+            if (EqualName(entry.Name, "Print Options")) break;
+            if (!afterPrinter || entry.Role != ROLE_SYSTEM_GROUPING ||
+                String.IsNullOrWhiteSpace(entry.Action))
+                continue;
+            if (Regex.IsMatch(entry.Name.Trim(), @"^(Ext|[0-9]+)(?:\s|$)", RegexOptions.IgnoreCase))
+                cards.Add(entry);
+        }
+        return cards;
+    }
+
+    private static int ChoiceRank(Entry entry)
+    {
+        if ((entry.State & STATE_SYSTEM_UNAVAILABLE) != 0 ||
+            String.IsNullOrWhiteSpace(entry.Action))
+            return 100;
+        if (entry.Role == ROLE_SYSTEM_MENUITEM || entry.Role == ROLE_SYSTEM_LISTITEM)
+            return 0;
+        if (entry.InChoiceContainer)
+            return 1;
+        if (entry.Role == ROLE_SYSTEM_GROUPING ||
+            entry.Role == ROLE_SYSTEM_COMBOBOX ||
+            entry.Role == ROLE_SYSTEM_DROPLIST)
+            return 2;
+        return 3;
+    }
+
+    private static bool ChoiceNameMatches(string actual, string desired)
+    {
+        if (String.IsNullOrWhiteSpace(actual) || String.IsNullOrWhiteSpace(desired))
+            return false;
+        string left = actual.Trim();
+        string right = desired.Trim();
+        return String.Equals(left, right, StringComparison.OrdinalIgnoreCase) ||
+            left.StartsWith(right + " ", StringComparison.OrdinalIgnoreCase) ||
+            left.IndexOf(right, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool SlotNameMatches(string actual, string desired)
+    {
+        if (String.IsNullOrWhiteSpace(actual) || String.IsNullOrWhiteSpace(desired))
+            return false;
+        string name = actual.Trim();
+        string slot = desired.Trim();
+        if (String.Equals(slot, "Ext", StringComparison.OrdinalIgnoreCase))
+            return Regex.IsMatch(name, @"^Ext(?:\s|$)", RegexOptions.IgnoreCase);
+        return Regex.IsMatch(name, @"^(?:A)?" + Regex.Escape(slot) + @"(?:\s|$)", RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsChoiceContainer(int role)
+    {
+        return role == ROLE_SYSTEM_MENUPOPUP ||
+            role == ROLE_SYSTEM_LIST ||
+            role == ROLE_SYSTEM_OUTLINE ||
+            role == ROLE_SYSTEM_COMBOBOX ||
+            role == ROLE_SYSTEM_DROPLIST;
+    }
+
+    private static bool IsOptionLabel(string name)
+    {
+        string[] labels = {
+            "Timelapse",
+            "Bed leveling",
+            "Nivelamento da mesa",
+            "Nivelamento automatico",
+            "Flow dynamic calibration",
+            "Dynamic flow calibration",
+            "Calibracao dinamica de fluxo"
+        };
+        return AnyEqual(name, labels);
+    }
+
+    private static bool IsSelected(Entry entry)
+    {
+        if ((entry.State & STATE_SYSTEM_CHECKED) != 0) return true;
+        string action = entry.Action ?? String.Empty;
+        return action.IndexOf("uncheck", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            action.IndexOf("deselect", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            action.IndexOf("desmarcar", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool Invoke(Entry entry)
+    {
+        if (entry == null || (entry.State & STATE_SYSTEM_UNAVAILABLE) != 0)
+            return false;
+        try
+        {
+            entry.Owner.accDoDefaultAction(entry.ChildId);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private static Entry MakeEntry(
+        IAccessible owner,
+        int childId,
+        bool inChoiceContainer)
+    {
+        object id = childId;
+        Entry entry = new Entry();
+        entry.Owner = owner;
+        entry.ChildId = childId;
+        entry.Name = SafeString(delegate { return owner.get_accName(id); });
+        entry.Action = SafeString(delegate { return owner.get_accDefaultAction(id); });
+        entry.Role = SafeInt(delegate { return owner.get_accRole(id); });
+        entry.State = SafeInt(delegate { return owner.get_accState(id); });
+        entry.InChoiceContainer = inChoiceContainer;
+        return entry;
+    }
+
+    private static int SafeChildCount(IAccessible accessible)
+    {
+        try
+        {
+            int count = accessible.accChildCount;
+            if (count < 0) return 0;
+            return Math.Min(count, MaxChildren);
+        }
+        catch { return 0; }
+    }
+
+    private static string SafeString(Func<string> getter)
+    {
+        try { return (getter() ?? String.Empty).Trim(); }
+        catch { return String.Empty; }
+    }
+
+    private static int SafeInt(Func<object> getter)
+    {
+        try
+        {
+            object value = getter();
+            return value == null ? 0 : Convert.ToInt32(value);
+        }
+        catch { return 0; }
+    }
+
+    private static bool EqualName(string actual, string expected)
+    {
+        return String.Equals(
+            (actual ?? String.Empty).Trim(),
+            (expected ?? String.Empty).Trim(),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool AnyEqual(string actual, string[] expected)
+    {
+        if (expected == null) return false;
+        foreach (string item in expected)
+            if (EqualName(actual, item)) return true;
+        return false;
+    }
+
+    private static long ComIdentity(object value)
+    {
+        IntPtr pointer = IntPtr.Zero;
+        try
+        {
+            pointer = Marshal.GetIUnknownForObject(value);
+            return pointer.ToInt64();
+        }
+        catch { return 0; }
+        finally
+        {
+            if (pointer != IntPtr.Zero) Marshal.Release(pointer);
+        }
+    }
+
+    private static string Clean(string value)
+    {
+        if (String.IsNullOrEmpty(value)) return String.Empty;
+        return value.Replace("\r", " ").Replace("\n", " ").Replace("|", "/").Trim();
+    }
+}
+'@
+    Add-Type -TypeDefinition $msaaSource -ReferencedAssemblies @(
+        [Accessibility.IAccessible].Assembly.Location
+    )
+}
+
+if ($CompileOnly) { exit 0 }
+
 $script:BridgeRoot = Join-Path $Root 'BaleiaConnect'
 $script:PendingDir = Join-Path $script:BridgeRoot 'Fila'
 $script:WorkingDir = Join-Path $script:BridgeRoot 'Processando'
@@ -44,6 +631,7 @@ $script:StopRequested = $false
 $script:TrayMode = $false
 $script:ConnectExecutable = $null
 $script:NotifyIcon = $null
+$script:SendMayHaveBeenInvoked = $false
 
 @($script:PendingDir, $script:WorkingDir, $script:ErrorDir, $script:RuntimeDir) | ForEach-Object {
     [void](New-Item -ItemType Directory -Force -Path $_)
@@ -191,173 +779,294 @@ function Stop-Connect {
     }
 }
 
-function Get-AutomationRoot {
-    param([IntPtr]$Handle)
-    if ($Handle -eq [IntPtr]::Zero) { return $null }
-    try { return [System.Windows.Automation.AutomationElement]::FromHandle($Handle) } catch { return $null }
+function Write-MsaaSnapshot {
+    param([string]$Stage)
+    try {
+        $handle = Get-ConnectWindow
+        if ($handle -eq [IntPtr]::Zero) { return }
+        $lines = @([BaleiaMsaaBridge]::Dump($handle))
+        $path = Join-Path $script:RuntimeDir 'msaa.log'
+        Add-Content -LiteralPath $path -Value @(
+            ('{0:u} MSAA snapshot: {1}' -f [DateTime]::UtcNow, $Stage),
+            $lines,
+            ''
+        ) -Encoding UTF8
+    } catch {}
 }
 
-function Get-ElementName {
-    param([System.Windows.Automation.AutomationElement]$Element)
-    try { return [string]$Element.Current.Name } catch { return '' }
-}
-
-function Get-NamedElements {
-    param(
-        [System.Windows.Automation.AutomationElement]$RootElement,
-        [string[]]$Names,
-        [System.Windows.Automation.ControlType[]]$ControlTypes
-    )
-    $matches = @()
-    if (-not $RootElement) { return $matches }
-    try {
-        $all = $RootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($element in $all) {
-            try {
-                if ($ControlTypes -and $ControlTypes.Count -gt 0 -and $ControlTypes -notcontains $element.Current.ControlType) { continue }
-                $name = ([string]$element.Current.Name).Trim()
-                foreach ($candidate in $Names) {
-                    if ([string]::Equals($name, $candidate, [StringComparison]::OrdinalIgnoreCase)) {
-                        $matches += $element
-                        break
-                    }
-                }
-            } catch {}
-        }
-    } catch {}
-    return @($matches)
-}
-
-function Invoke-AutomationElement {
-    param([System.Windows.Automation.AutomationElement]$Element)
-    if (-not $Element) { return $false }
-    try {
-        $pattern = $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
-        return $true
-    } catch {}
-    try {
-        $pattern = $Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-        ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
-        return $true
-    } catch {}
-    try {
-        $pattern = $Element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
-        ([System.Windows.Automation.LegacyIAccessiblePattern]$pattern).DoDefaultAction()
-        return $true
-    } catch {}
-    return $false
-}
-
-function Wait-AndInvokeNamedControl {
-    param(
-        [string[]]$Names,
-        [int]$TimeoutSeconds,
-        [System.Windows.Automation.AutomationElement]$ExcludeElement = $null
-    )
+function Wait-MsaaDialog {
+    param([string]$Name, [int]$TimeoutSeconds)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $types = @(
-        [System.Windows.Automation.ControlType]::Button,
-        [System.Windows.Automation.ControlType]::Hyperlink,
-        [System.Windows.Automation.ControlType]::MenuItem
-    )
     do {
-        if (-not (Test-BaleiaRunning)) { return $null }
-        $rootElement = Get-AutomationRoot (Get-ConnectWindow)
-        foreach ($element in (Get-NamedElements $rootElement $Names $types)) {
-            if ($ExcludeElement) {
-                try {
-                    if ([System.Windows.Automation.Automation]::Compare($element, $ExcludeElement)) { continue }
-                } catch {}
-            }
-            try {
-                if (-not $element.Current.IsEnabled) { continue }
-            } catch { continue }
-            if (Invoke-AutomationElement $element) { return $element }
+        if (-not (Test-BaleiaRunning)) { return $false }
+        $handle = Get-ConnectWindow
+        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::HasDialog($handle, $Name)) {
+            return $true
         }
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
-    return $null
+    return $false
 }
 
-function Get-WindowTextSnapshot {
-    $names = New-Object System.Collections.Generic.List[string]
-    $rootElement = Get-AutomationRoot (Get-ConnectWindow)
-    if (-not $rootElement) { return '' }
-    try {
-        $all = $rootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($element in $all) {
-            try {
-                $name = ([string]$element.Current.Name).Trim()
-                if ($name) { $names.Add($name) }
-            } catch {}
-        }
-    } catch {}
-    return ($names -join "`n")
-}
-
-function Wait-PrintingEvidence {
-    param([string]$DisplayName, [int]$TimeoutSeconds = 20)
+function Wait-AndPressMsaaButton {
+    param([string]$Name, [int]$TimeoutSeconds)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if (-not (Test-BaleiaRunning)) { return $false }
-        $snapshot = Get-WindowTextSnapshot
-        if ($snapshot -match '(?i)Printing|Imprimindo|Sending|Enviando|Uploading|Carregando') { return $true }
-        if ($DisplayName -and $snapshot -match [Regex]::Escape($DisplayName) -and
-            $snapshot -match '(?i)Progress|Progresso|Layer|Camada') { return $true }
-        Start-Sleep -Milliseconds 400
+        $handle = Get-ConnectWindow
+        if ($handle -ne [IntPtr]::Zero -and [BaleiaMsaaBridge]::PressExactButton($handle, $Name)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
+}
+
+function Wait-AndPressMsaaDialogButton {
+    param(
+        [string]$DialogName,
+        [string]$ButtonName,
+        [int]$TimeoutSeconds
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-BaleiaRunning)) { return $false }
+        $handle = Get-ConnectWindow
+        if ($handle -ne [IntPtr]::Zero -and
+            [BaleiaMsaaBridge]::PressButtonInDialog($handle, $DialogName, $ButtonName)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Set-MsaaPrinter {
+    param([string]$PrinterName, [int]$TimeoutSeconds = 15)
+    if (-not $PrinterName) { return $false }
+
+    $handle = Get-ConnectWindow
+    $status = [BaleiaMsaaBridge]::OpenPrinterPicker(
+        $handle,
+        'Send to print',
+        $PrinterName)
+    if ($status -eq 'already-selected') {
+        Write-BaleiaLog ('Connect already shows printer ' + $PrinterName)
+        return $true
+    }
+    if ($status -ne 'opened') {
+        Write-BaleiaLog ('Printer selector: ' + $status)
+        return $false
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if ([BaleiaMsaaBridge]::ChoosePrinter((Get-ConnectWindow), $PrinterName)) {
+            Write-BaleiaLog ('Connect printer selected: ' + $PrinterName)
+            Start-Sleep -Milliseconds 700
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Get-ExpectedAmsSlots {
+    param($Manifest)
+    $slots = @()
+    try {
+        foreach ($value in @($Manifest.mapping.ams)) {
+            $number = [int]$value
+            if ($number -lt 0) { $slots += 'Ext' } else { $slots += [string]($number + 1) }
+        }
+    } catch { return @() }
+    return @($slots)
+}
+
+function Get-FilamentCardSlot {
+    param([string]$CardName)
+    if ($CardName -match '^(Ext|[0-9]+)(?:\s|$)') { return [string]$Matches[1] }
+    return ''
+}
+
+function Wait-MsaaFilamentCards {
+    param([int]$ExpectedCount, [int]$TimeoutSeconds = 10)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $cards = @([BaleiaMsaaBridge]::GetFilamentCards(
+            (Get-ConnectWindow),
+            'Send to print'))
+        if ($cards.Count -eq $ExpectedCount) { return @($cards) }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return @($cards)
+}
+
+function Set-MsaaFilamentMapping {
+    param($Manifest)
+    $expected = @(Get-ExpectedAmsSlots $Manifest)
+    if ($expected.Count -eq 0) {
+        Write-BaleiaLog 'Manifest has no filament mapping to apply.'
+        return $true
+    }
+
+    $cards = @(Wait-MsaaFilamentCards $expected.Count 12)
+    if ($cards.Count -ne $expected.Count) {
+        Write-BaleiaLog ('Filament cards found: ' + $cards.Count + '; expected: ' + $expected.Count)
+        return $false
+    }
+
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        $current = Get-FilamentCardSlot ([string]$cards[$index])
+        $wanted = [string]$expected[$index]
+        if ([string]::Equals($current, $wanted, [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        if (-not [BaleiaMsaaBridge]::OpenFilamentCard(
+            (Get-ConnectWindow),
+            'Send to print',
+            $index)) {
+            return $false
+        }
+        Start-Sleep -Milliseconds 350
+
+        $chosen = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        do {
+            $chosen = [BaleiaMsaaBridge]::ChooseFilamentSlot(
+                (Get-ConnectWindow),
+                $wanted)
+            if (-not $chosen) { Start-Sleep -Milliseconds 300 }
+        } while (-not $chosen -and [DateTime]::UtcNow -lt $deadline)
+        if (-not $chosen) { return $false }
+        Start-Sleep -Milliseconds 500
+        $cards = @(Wait-MsaaFilamentCards $expected.Count 5)
+    }
+
+    $actual = @($cards | ForEach-Object { Get-FilamentCardSlot ([string]$_) })
+    Write-BaleiaLog ('Filament mapping: [' + ($actual -join ',') + ']')
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if (-not [string]::Equals(
+            [string]$actual[$index],
+            [string]$expected[$index],
+            [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Set-MsaaOption {
+    param([string[]]$Labels, [bool]$Enabled)
+    $status = [BaleiaMsaaBridge]::SetOption(
+        (Get-ConnectWindow),
+        'Send to print',
+        $Labels,
+        $Enabled)
+    Write-BaleiaLog (($Labels | Select-Object -First 1) + ': ' + $status)
+    return ($status -eq 'selected' -or $status -eq 'already-selected')
 }
 
 function Invoke-ConnectPrintFlow {
     param($Manifest, [string]$GcodePath)
 
+    $returnToTray = $script:TrayMode
+    $script:SendMayHaveBeenInvoked = $false
     if (-not (Ensure-ConnectRunning)) { throw 'Bambu Connect não foi encontrado ou não abriu.' }
 
-    $encodedPath = [Uri]::EscapeDataString($GcodePath)
-    $encodedName = [Uri]::EscapeDataString([string]$Manifest.display_name)
-    $uri = 'bambu-connect://import-file?path={0}&name={1}&version=1.0.0' -f $encodedPath, $encodedName
-    Start-Process $uri | Out-Null
+    $screenReaderWasEnabled = [BaleiaMsaaBridge]::GetScreenReaderFlag()
+    try {
+        if (-not $screenReaderWasEnabled) {
+            [BaleiaMsaaBridge]::SetScreenReaderFlag($true)
+        }
+        Start-Sleep -Milliseconds 1200
 
-    $handle = Wait-ConnectWindow -TimeoutSeconds 30
-    if ($handle -eq [IntPtr]::Zero) { throw 'A janela do Bambu Connect não apareceu.' }
-    if ($script:TrayMode) { [void][BaleiaNativeWindow]::ShowWindowAsync($handle, 0) }
+        $encodedPath = [Uri]::EscapeDataString($GcodePath)
+        $encodedName = [Uri]::EscapeDataString([string]$Manifest.display_name)
+        $uri = 'bambu-connect://import-file?path={0}&name={1}&version=1.0.0' -f $encodedPath, $encodedName
+        Start-Process $uri | Out-Null
 
-    $importButton = Wait-AndInvokeNamedControl @(
-        'Import', 'Import File', 'Import G-code 3MF', 'Import Gcode 3MF',
-        'Importar', 'Importar arquivo', 'Aceitar', 'Confirm', 'Confirmar', 'OK'
-    ) 45
-    if (-not $importButton) { throw 'O botão de importação do Bambu Connect não foi localizado.' }
-    Write-BaleiaLog ('Import accepted for ' + $Manifest.job_id)
+        $handle = Wait-ConnectWindow -TimeoutSeconds 30
+        if ($handle -eq [IntPtr]::Zero) { throw 'A janela do Bambu Connect não apareceu.' }
+        if ($returnToTray) { Hide-ConnectWindow }
 
-    $printButton = Wait-AndInvokeNamedControl @('Print', 'Imprimir') 60
-    if (-not $printButton) { throw 'O botão Print do Bambu Connect não foi localizado.' }
-    Write-BaleiaLog ('Print invoked for ' + $Manifest.job_id + ' on ' + $Manifest.printer.name)
+        if (-not (Wait-AndPressMsaaDialogButton 'Import file' 'confirm' 45)) {
+            Write-MsaaSnapshot 'import confirm not found'
+            throw 'O botão de importação do Bambu Connect não foi localizado.'
+        }
+        Write-BaleiaLog ('Import accepted for ' + $Manifest.job_id)
 
-    # From this click onward Bambu Connect owns authentication, printer-busy
-    # checks and the actual transport. Do not add a second guessed validation
-    # layer here: the final printer and AMS choices were already made in Baleia
-    # and are retained in the manifest for diagnosis.
-    if (-not (Wait-PrintingEvidence ([string]$Manifest.display_name) 12)) {
-        Write-BaleiaLog ('Connect accepted Print without exposing a stable progress label for ' + $Manifest.job_id)
+        if (-not (Wait-AndPressMsaaButton 'Print' 60)) {
+            Write-MsaaSnapshot 'page Print not found'
+            throw 'O botão Print do Bambu Connect não foi localizado.'
+        }
+        Write-BaleiaLog ('Print dialog requested for ' + $Manifest.job_id)
+
+        if (-not (Wait-MsaaDialog 'Send to print' 30)) {
+            Write-MsaaSnapshot 'Send to print dialog not found'
+            throw 'A janela final de envio do Bambu Connect não apareceu.'
+        }
+
+        $printerName = [string]$Manifest.printer.name
+        if (-not (Set-MsaaPrinter $printerName 15)) {
+            Write-MsaaSnapshot 'printer selection failed'
+            throw ('A impressora não foi selecionada no Connect: ' + $printerName)
+        }
+
+        if (-not (Set-MsaaFilamentMapping $Manifest)) {
+            Write-MsaaSnapshot 'filament mapping failed'
+            throw 'O mapeamento de filamentos não foi aplicado no Connect.'
+        }
+
+        if (-not (Set-MsaaOption @('Timelapse') ([bool]$Manifest.options.timelapse))) {
+            throw 'A opção Timelapse não foi aplicada no Connect.'
+        }
+        if (-not (Set-MsaaOption @(
+            'Flow dynamic calibration',
+            'Dynamic flow calibration',
+            'Calibracao dinamica de fluxo'
+        ) ([bool]$Manifest.options.flow_calibration))) {
+            throw 'A calibração dinâmica de fluxo não foi aplicada no Connect.'
+        }
+        if (-not (Set-MsaaOption @(
+            'Bed leveling',
+            'Nivelamento da mesa',
+            'Nivelamento automatico'
+        ) ([bool]$Manifest.options.bed_leveling))) {
+            throw 'O nivelamento da mesa não foi aplicado no Connect.'
+        }
+
+        # The final button is invoked exactly once. There is deliberately no
+        # retry after this point: Connect owns validation and transport.
+        $script:SendMayHaveBeenInvoked = $true
+        if (-not [BaleiaMsaaBridge]::PressButtonInDialog(
+            (Get-ConnectWindow),
+            'Send to print',
+            'confirm')) {
+            Write-MsaaSnapshot 'final confirm result uncertain'
+            throw 'O estado do envio ficou incerto. Confira o Connect antes de repetir.'
+        }
+        Write-BaleiaLog ('Send invoked once for ' + $Manifest.job_id + ' on ' + $printerName)
+
+        if ($returnToTray) { Hide-ConnectWindow }
+    } finally {
+        if (-not $screenReaderWasEnabled) {
+            try { [BaleiaMsaaBridge]::SetScreenReaderFlag($false) } catch {}
+        }
     }
-    if ($script:TrayMode) { Hide-ConnectWindow }
 }
 
 function Move-JobToError {
     param([string]$ManifestPath, [string]$GcodePath, [string]$Message)
+    if ($script:SendMayHaveBeenInvoked) {
+        $Message = 'ATENÇÃO: o Send pode ter sido acionado. Confira o Connect e a impressora antes de repetir. ' + $Message
+    }
     try {
         $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileNameWithoutExtension($ManifestPath))
         $targetManifest = Join-Path $script:ErrorDir ([IO.Path]::GetFileName($ManifestPath))
         Move-Item -LiteralPath $ManifestPath -Destination $targetManifest -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $GcodePath) {
-            Move-Item -LiteralPath $GcodePath -Destination (Join-Path $script:ErrorDir ([IO.Path]::GetFileName($GcodePath))) -Force -ErrorAction SilentlyContinue
+            Copy-Item -LiteralPath $GcodePath -Destination (Join-Path $script:ErrorDir ([IO.Path]::GetFileName($GcodePath))) -Force -ErrorAction SilentlyContinue
         }
         Set-Content -LiteralPath (Join-Path $script:ErrorDir ($baseName + '.error.txt')) -Value $Message -Encoding UTF8
     } catch {}
