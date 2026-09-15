@@ -176,6 +176,7 @@ if (-not ('BaleiaMsaaBridge' -as [type])) {
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using Accessibility;
 
@@ -200,6 +201,8 @@ public static class BaleiaMsaaBridge
 
     private const int STATE_SYSTEM_UNAVAILABLE = 0x00000001;
     private const int STATE_SYSTEM_CHECKED = 0x00000010;
+    private const int STATE_SYSTEM_INVISIBLE = 0x00008000;
+    private const int STATE_SYSTEM_OFFSCREEN = 0x00010000;
     private const int MaxDepth = 40;
     private const int MaxChildren = 10000;
 
@@ -368,14 +371,36 @@ public static class BaleiaMsaaBridge
 
         foreach (Entry entry in Flatten(dialog))
         {
-            if (entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) < 0)
+            if (entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) < 0 ||
+                String.IsNullOrWhiteSpace(entry.Action) ||
+                IsHiddenOrUnavailable(entry))
                 continue;
-            if (String.IsNullOrWhiteSpace(entry.Action))
-                continue;
+
+            string selected = PrinterNameFromSelector(entry.Name);
             if (!String.IsNullOrWhiteSpace(printerName) &&
-                entry.Name.IndexOf(printerName.Trim(), StringComparison.OrdinalIgnoreCase) >= 0)
+                ChoiceNameMatches(selected, printerName))
                 return "already-selected";
             return Invoke(entry) ? "opened" : "invoke-failed";
+        }
+        return "missing-selector";
+    }
+
+    public static string GetSelectedPrinter(
+        IntPtr topWindow,
+        string dialogName)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return "missing-dialog";
+
+        foreach (Entry entry in Flatten(dialog))
+        {
+            if (entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) < 0 ||
+                String.IsNullOrWhiteSpace(entry.Action) ||
+                IsHiddenOrUnavailable(entry))
+                continue;
+
+            string selected = PrinterNameFromSelector(entry.Name);
+            if (!String.IsNullOrWhiteSpace(selected)) return selected;
         }
         return "missing-selector";
     }
@@ -389,7 +414,8 @@ public static class BaleiaMsaaBridge
         {
             foreach (Entry entry in Flatten(root))
             {
-                if (!ChoiceNameMatches(entry.Name, printerName) ||
+                if (IsHiddenOrUnavailable(entry) ||
+                    !ChoiceNameMatches(entry.Name, printerName) ||
                     entry.Name.IndexOf("chevron_down", StringComparison.OrdinalIgnoreCase) >= 0)
                     continue;
 
@@ -462,15 +488,7 @@ public static class BaleiaMsaaBridge
         if (dialog == null) return "missing-dialog";
 
         List<Entry> entries = Flatten(dialog);
-        int labelIndex = -1;
-        for (int index = 0; index < entries.Count; index++)
-        {
-            if (AnyEqual(entries[index].Name, labelNames))
-            {
-                labelIndex = index;
-                break;
-            }
-        }
+        int labelIndex = FindOptionLabel(entries, labelNames);
         if (labelIndex < 0) return "missing-label";
 
         string desired = enabled ? "On" : "Off";
@@ -484,6 +502,31 @@ public static class BaleiaMsaaBridge
             return Invoke(entry) ? "selected" : "invoke-failed";
         }
         return "missing-choice";
+    }
+
+    public static string GetOptionState(
+        IntPtr topWindow,
+        string dialogName,
+        string[] labelNames)
+    {
+        IAccessible dialog = FindDialog(topWindow, dialogName);
+        if (dialog == null) return "missing-dialog";
+
+        List<Entry> entries = Flatten(dialog);
+        int labelIndex = FindOptionLabel(entries, labelNames);
+        if (labelIndex < 0) return "missing-label";
+
+        bool sawChoice = false;
+        for (int index = labelIndex + 1; index < entries.Count; index++)
+        {
+            Entry entry = entries[index];
+            if (IsOptionLabel(entry.Name)) break;
+            if (entry.Role != ROLE_SYSTEM_RADIOBUTTON) continue;
+            if (!EqualName(entry.Name, "On") && !EqualName(entry.Name, "Off")) continue;
+            sawChoice = true;
+            if (IsSelected(entry)) return Fold(entry.Name).ToLowerInvariant();
+        }
+        return sawChoice ? "unknown" : "missing-choice";
     }
 
     public static string[] Dump(IntPtr topWindow)
@@ -646,9 +689,27 @@ public static class BaleiaMsaaBridge
         return cards;
     }
 
+    private static bool IsHiddenOrUnavailable(Entry entry)
+    {
+        return entry == null ||
+            (entry.State & STATE_SYSTEM_UNAVAILABLE) != 0 ||
+            (entry.State & STATE_SYSTEM_INVISIBLE) != 0 ||
+            (entry.State & STATE_SYSTEM_OFFSCREEN) != 0;
+    }
+
+    private static string PrinterNameFromSelector(string value)
+    {
+        string result = Regex.Replace(
+            value ?? String.Empty,
+            @"chevron_down|expand_more|arrow_drop_down",
+            " ",
+            RegexOptions.IgnoreCase);
+        return Regex.Replace(result, @"\s+", " ").Trim();
+    }
+
     private static int ChoiceRank(Entry entry)
     {
-        if ((entry.State & STATE_SYSTEM_UNAVAILABLE) != 0 ||
+        if (IsHiddenOrUnavailable(entry) ||
             String.IsNullOrWhiteSpace(entry.Action))
             return 100;
         if (entry.Role == ROLE_SYSTEM_MENUITEM || entry.Role == ROLE_SYSTEM_LISTITEM)
@@ -666,11 +727,10 @@ public static class BaleiaMsaaBridge
     {
         if (String.IsNullOrWhiteSpace(actual) || String.IsNullOrWhiteSpace(desired))
             return false;
-        string left = actual.Trim();
-        string right = desired.Trim();
+        string left = Fold(Clean(actual));
+        string right = Fold(Clean(desired));
         return String.Equals(left, right, StringComparison.OrdinalIgnoreCase) ||
-            left.StartsWith(right + " ", StringComparison.OrdinalIgnoreCase) ||
-            left.IndexOf(right, StringComparison.OrdinalIgnoreCase) >= 0;
+            left.StartsWith(right + " ", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool SlotNameMatches(string actual, string desired)
@@ -705,6 +765,13 @@ public static class BaleiaMsaaBridge
             "Calibracao dinamica de fluxo"
         };
         return AnyEqual(name, labels);
+    }
+
+    private static int FindOptionLabel(List<Entry> entries, string[] labelNames)
+    {
+        for (int index = 0; index < entries.Count; index++)
+            if (AnyEqual(entries[index].Name, labelNames)) return index;
+        return -1;
     }
 
     private static bool IsSelected(Entry entry)
@@ -775,9 +842,22 @@ public static class BaleiaMsaaBridge
     private static bool EqualName(string actual, string expected)
     {
         return String.Equals(
-            (actual ?? String.Empty).Trim(),
-            (expected ?? String.Empty).Trim(),
+            Fold(actual),
+            Fold(expected),
             StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string Fold(string value)
+    {
+        string normalized = (value ?? String.Empty).Normalize(NormalizationForm.FormD);
+        StringBuilder builder = new StringBuilder(normalized.Length);
+        foreach (char item in normalized)
+        {
+            if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(item) !=
+                System.Globalization.UnicodeCategory.NonSpacingMark)
+                builder.Append(item);
+        }
+        return builder.ToString().Normalize(NormalizationForm.FormC).Trim();
     }
 
     private static bool AnyEqual(string actual, string[] expected)
@@ -821,6 +901,7 @@ $script:BridgeRoot = Join-Path $Root 'BaleiaConnect'
 $script:PendingDir = Join-Path $script:BridgeRoot 'Fila'
 $script:WorkingDir = Join-Path $script:BridgeRoot 'Processando'
 $script:ErrorDir = Join-Path $script:BridgeRoot 'Erros'
+$script:ReceiptDir = Join-Path $script:BridgeRoot 'Comprovantes'
 $script:RuntimeDir = Join-Path $script:BridgeRoot 'Runtime'
 $script:LogPath = Join-Path $script:RuntimeDir 'helper.log'
 $script:StatusPath = Join-Path $script:RuntimeDir 'connect.status'
@@ -836,10 +917,12 @@ $script:LastStatusWrite = [DateTime]::MinValue
 $script:NextConnectStart = [DateTime]::MinValue
 $script:SendMayHaveBeenInvoked = $false
 $script:QueueBlocked = $false
+$script:ActiveReceiptPath = ''
+$script:ActiveFileHash = ''
 $script:ScreenReaderChanged = $false
 $script:ScreenReaderWasEnabled = $true
 
-@($script:PendingDir, $script:WorkingDir, $script:ErrorDir, $script:RuntimeDir) | ForEach-Object {
+@($script:PendingDir, $script:WorkingDir, $script:ErrorDir, $script:ReceiptDir, $script:RuntimeDir) | ForEach-Object {
     [void](New-Item -ItemType Directory -Force -Path $_)
 }
 
@@ -849,6 +932,70 @@ function Write-BaleiaLog {
         $line = '{0:u} {1}' -f [DateTime]::UtcNow, $Message
         Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
     } catch {}
+}
+
+function Write-JobAudit {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($script:ActiveReceiptPath)) { return }
+    try {
+        $line = '{0:u} {1}' -f [DateTime]::UtcNow, $Message
+        Add-Content -LiteralPath $script:ActiveReceiptPath -Value $line -Encoding UTF8
+    } catch {}
+}
+
+function Write-FieldAudit {
+    param(
+        [string]$Field,
+        [string]$Expected,
+        [string]$Before,
+        [string]$Action,
+        [string]$After,
+        [string]$Result
+    )
+    Write-JobAudit ('CAMPO: ' + $Field)
+    Write-JobAudit ('  Esperado: ' + $Expected)
+    Write-JobAudit ('  Antes: ' + $Before)
+    Write-JobAudit ('  Acao: ' + $Action)
+    Write-JobAudit ('  Depois: ' + $After)
+    Write-JobAudit ('  Resultado: ' + $Result)
+    Write-BaleiaLog ($Field + ' => ' + $Result + ' (esperado=' + $Expected + '; depois=' + $After + ')')
+}
+
+function Get-SafeProperty {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    try {
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        return $property.Value
+    } catch {
+        return $null
+    }
+}
+
+function Start-JobAudit {
+    param($Manifest, [string]$GcodePath)
+    $jobId = [string](Get-SafeProperty $Manifest 'job_id')
+    if ([string]::IsNullOrWhiteSpace($jobId)) {
+        $jobId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+    }
+    $script:ActiveReceiptPath = Join-Path $script:ReceiptDir ($jobId + '.txt')
+    $connectVersion = 'desconhecida'
+    try {
+        if ($script:ConnectExecutable -and (Test-Path -LiteralPath $script:ConnectExecutable)) {
+            $connectVersion = [string](Get-Item -LiteralPath $script:ConnectExecutable).VersionInfo.FileVersion
+        }
+    } catch {}
+    @(
+        'BALEIA ORCA VR005 - COMPROVANTE DE ENVIO'
+        ('Job: ' + $jobId)
+        ('Arquivo: ' + [string](Get-SafeProperty $Manifest 'display_name'))
+        ('Fila: ' + $GcodePath)
+        ('Impressora pedida: ' + [string](Get-SafeProperty (Get-SafeProperty $Manifest 'printer') 'name'))
+        ('Bambu Connect: ' + $connectVersion)
+        'STATUS: VERIFICANDO'
+        ''
+    ) | Set-Content -LiteralPath $script:ActiveReceiptPath -Encoding UTF8
 }
 
 function Test-BaleiaRunning {
@@ -1169,67 +1316,115 @@ function Wait-AndPressMsaaDialogButton {
     return $false
 }
 
+function Get-MsaaPrinter {
+    Protect-ConnectWindow
+    return [string][BaleiaMsaaBridge]::GetSelectedPrinter(
+        (Get-ConnectWindow),
+        'Send to print')
+}
+
+function Test-PrinterSelection {
+    param([string]$Actual, [string]$Expected)
+    if ([string]::IsNullOrWhiteSpace($Actual) -or
+        [string]::IsNullOrWhiteSpace($Expected) -or
+        $Actual -like 'missing-*') {
+        return $false
+    }
+    return [string]::Equals($Actual, $Expected, [StringComparison]::OrdinalIgnoreCase) -or
+        $Actual.StartsWith($Expected + ' ', [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Set-MsaaPrinter {
     param([string]$PrinterName, [int]$TimeoutSeconds = 15)
     if (-not $PrinterName) { return $false }
 
-    $handle = Get-ConnectWindow
-    $status = [BaleiaMsaaBridge]::OpenPrinterPicker(
-        $handle,
-        'Send to print',
-        $PrinterName)
-    if ($status -eq 'already-selected') {
-        Write-BaleiaLog ('Connect already shows printer ' + $PrinterName)
+    $before = Get-MsaaPrinter
+    if (Test-PrinterSelection $before $PrinterName) {
+        Write-FieldAudit 'IMPRESSORA' $PrinterName $before 'Nenhuma' $before 'JA ESTAVA OK'
         return $true
     }
-    if ($status -ne 'opened') {
-        Write-BaleiaLog ('Printer selector: ' + $status)
-        return $false
-    }
 
+    $after = $before
+    $action = 'Trocar para ' + $PrinterName
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $attempt = 0
     do {
+        $attempt++
         Protect-ConnectWindow
-        if ([BaleiaMsaaBridge]::ChoosePrinter((Get-ConnectWindow), $PrinterName)) {
-            Write-BaleiaLog ('Connect printer selected: ' + $PrinterName)
+        $status = [BaleiaMsaaBridge]::OpenPrinterPicker(
+            (Get-ConnectWindow),
+            'Send to print',
+            $PrinterName)
+        if ($status -eq 'already-selected') {
+            Start-Sleep -Milliseconds 300
+        } elseif ($status -eq 'opened') {
+            $choiceDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                Protect-ConnectWindow
+                if ([BaleiaMsaaBridge]::ChoosePrinter((Get-ConnectWindow), $PrinterName)) { break }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $choiceDeadline)
             Start-Sleep -Milliseconds 700
+        } else {
+            Write-BaleiaLog ('Printer selector: ' + $status)
+        }
+
+        $after = Get-MsaaPrinter
+        if (Test-PrinterSelection $after $PrinterName) {
+            Write-FieldAudit 'IMPRESSORA' $PrinterName $before ($action + ' / tentativa ' + $attempt) $after 'OK'
             return $true
         }
-        Start-Sleep -Milliseconds 300
-    } while ([DateTime]::UtcNow -lt $deadline)
+        Start-Sleep -Milliseconds 350
+    } while ($attempt -lt 2 -and [DateTime]::UtcNow -lt $deadline)
+
+    Write-FieldAudit 'IMPRESSORA' $PrinterName $before ($action + ' / ' + $attempt + ' tentativas') $after 'FALHA'
     return $false
 }
 
-function Get-ExpectedAmsSlots {
+function Get-ExpectedFilaments {
     param($Manifest)
-    $slots = @()
+    $items = @()
     try {
-        $mapping = @($Manifest.mapping.ams)
-        $details = @($Manifest.mapping.details)
+        $mappingObject = Get-SafeProperty $Manifest 'mapping'
+        $mapping = @(Get-SafeProperty $mappingObject 'ams')
+        $details = @(Get-SafeProperty $mappingObject 'details')
         for ($index = 0; $index -lt $mapping.Count; $index++) {
-            $used = $true
-            if ($details.Count -gt 0) {
-                if ($index -ge $details.Count) { continue }
-                $detail = $details[$index]
-                $used = -not [string]::IsNullOrWhiteSpace([string]$detail.filamentType) -or
-                    -not [string]::IsNullOrWhiteSpace([string]$detail.filamentId) -or
-                    -not [string]::IsNullOrWhiteSpace([string]$detail.sourceColor)
-            }
+            $detail = $null
+            if ($index -lt $details.Count) { $detail = $details[$index] }
+            $filamentType = [string](Get-SafeProperty $detail 'filamentType')
+            $filamentId = [string](Get-SafeProperty $detail 'filamentId')
+            $sourceColor = [string](Get-SafeProperty $detail 'sourceColor')
+            $targetColor = [string](Get-SafeProperty $detail 'targetColor')
+            $used = -not [string]::IsNullOrWhiteSpace($filamentType) -or
+                -not [string]::IsNullOrWhiteSpace($filamentId) -or
+                -not [string]::IsNullOrWhiteSpace($sourceColor)
             if (-not $used) { continue }
+
             $number = [int]$mapping[$index]
-            if ($number -lt 0 -or $number -ge 254) { $slots += 'Ext' }
-            else { $slots += [string]($number + 1) }
+            $slot = if ($number -lt 0 -or $number -ge 254) { 'Ext' } else { [string]($number + 1) }
+            $items += [PSCustomObject]@{
+                Slot = $slot
+                FilamentType = $filamentType
+                SourceColor = $sourceColor
+                TargetColor = $targetColor
+            }
         }
     } catch {
         Write-BaleiaLog ('Could not read filament mapping: ' + $_.Exception.Message)
         return @()
     }
-    return @($slots)
+    return @($items)
+}
+
+function Get-ExpectedAmsSlots {
+    param($Manifest)
+    return @(Get-ExpectedFilaments $Manifest | ForEach-Object { [string]$_.Slot })
 }
 
 function Get-FilamentCardSlot {
     param([string]$CardName)
-    if ($CardName -match '^(Ext|[0-9]+)(?:\s|$)') { return [string]$Matches[1] }
+    if ($CardName -match '^Ext(?:\s|$)') { return 'Ext' }
+    if ($CardName -match '^(?:A)?([0-9]+)(?:\s|$)') { return [string]$Matches[1] }
     return ''
 }
 
@@ -1249,68 +1444,172 @@ function Wait-MsaaFilamentCards {
 
 function Set-MsaaFilamentMapping {
     param($Manifest)
-    $expected = @(Get-ExpectedAmsSlots $Manifest)
+    $expected = @(Get-ExpectedFilaments $Manifest)
     if ($expected.Count -eq 0) {
-        Write-BaleiaLog 'Manifest has no filament mapping to apply.'
+        Write-FieldAudit 'FILAMENTOS' 'Sem mapeamento informado' 'Sem dados' 'Nenhuma' 'Sem dados' 'JA ESTAVA OK'
         return $true
     }
 
     $cards = @(Wait-MsaaFilamentCards $expected.Count 12)
     if ($cards.Count -ne $expected.Count) {
-        Write-BaleiaLog ('Filament cards found: ' + $cards.Count + '; expected: ' + $expected.Count)
+        Write-FieldAudit 'QUANTIDADE DE FILAMENTOS' ([string]$expected.Count) ([string]$cards.Count) 'Ler cartoes do Connect' ([string]$cards.Count) 'FALHA'
         return $false
     }
 
     for ($index = 0; $index -lt $expected.Count; $index++) {
-        $current = Get-FilamentCardSlot ([string]$cards[$index])
-        $wanted = [string]$expected[$index]
-        if ([string]::Equals($current, $wanted, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $item = $expected[$index]
+        $wanted = [string]$item.Slot
+        $beforeCard = [string]$cards[$index]
+        $current = Get-FilamentCardSlot $beforeCard
+        $description = $wanted + ' / ' + [string]$item.FilamentType +
+            ' / modelo ' + [string]$item.SourceColor +
+            ' / carretel ' + [string]$item.TargetColor
 
-        if (-not [BaleiaMsaaBridge]::OpenFilamentCard(
-            (Get-ConnectWindow),
-            'Send to print',
-            $index)) {
-            return $false
+        if ([string]::Equals($current, $wanted, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-FieldAudit ('FILAMENTO ' + ($index + 1)) $description $beforeCard 'Nenhuma' $beforeCard 'JA ESTAVA OK'
+            continue
         }
-        Start-Sleep -Milliseconds 350
 
-        $chosen = $false
-        $deadline = [DateTime]::UtcNow.AddSeconds(10)
-        do {
+        $afterCard = $beforeCard
+        $action = 'Selecionar ' + $wanted
+        $changed = $false
+        for ($attempt = 1; $attempt -le 2 -and -not $changed; $attempt++) {
             Protect-ConnectWindow
-            $chosen = [BaleiaMsaaBridge]::ChooseFilamentSlot(
+            if (-not [BaleiaMsaaBridge]::OpenFilamentCard(
                 (Get-ConnectWindow),
-                $wanted)
-            if (-not $chosen) { Start-Sleep -Milliseconds 300 }
-        } while (-not $chosen -and [DateTime]::UtcNow -lt $deadline)
-        if (-not $chosen) { return $false }
-        Start-Sleep -Milliseconds 500
-        $cards = @(Wait-MsaaFilamentCards $expected.Count 5)
-    }
+                'Send to print',
+                $index)) {
+                Start-Sleep -Milliseconds 300
+                continue
+            }
+            Start-Sleep -Milliseconds 350
 
-    $actual = @($cards | ForEach-Object { Get-FilamentCardSlot ([string]$_) })
-    Write-BaleiaLog ('Filament mapping: [' + ($actual -join ',') + ']')
-    for ($index = 0; $index -lt $expected.Count; $index++) {
-        if (-not [string]::Equals(
-            [string]$actual[$index],
-            [string]$expected[$index],
-            [StringComparison]::OrdinalIgnoreCase)) {
+            $chosen = $false
+            $choiceDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                Protect-ConnectWindow
+                $chosen = [BaleiaMsaaBridge]::ChooseFilamentSlot(
+                    (Get-ConnectWindow),
+                    $wanted)
+                if (-not $chosen) { Start-Sleep -Milliseconds 250 }
+            } while (-not $chosen -and [DateTime]::UtcNow -lt $choiceDeadline)
+
+            if ($chosen) {
+                Start-Sleep -Milliseconds 650
+                $cards = @(Wait-MsaaFilamentCards $expected.Count 5)
+                if ($cards.Count -eq $expected.Count) {
+                    $afterCard = [string]$cards[$index]
+                    $afterSlot = Get-FilamentCardSlot $afterCard
+                    $changed = [string]::Equals(
+                        $afterSlot,
+                        $wanted,
+                        [StringComparison]::OrdinalIgnoreCase)
+                }
+            }
+        }
+
+        if (-not $changed) {
+            Write-FieldAudit ('FILAMENTO ' + ($index + 1)) $description $beforeCard $action $afterCard 'FALHA'
             return $false
         }
+        Write-FieldAudit ('FILAMENTO ' + ($index + 1)) $description $beforeCard $action $afterCard 'OK'
     }
     return $true
 }
 
-function Set-MsaaOption {
-    param([string[]]$Labels, [bool]$Enabled)
+function Get-MsaaOptionState {
+    param([string[]]$Labels)
     Protect-ConnectWindow
-    $status = [BaleiaMsaaBridge]::SetOption(
+    return [string][BaleiaMsaaBridge]::GetOptionState(
         (Get-ConnectWindow),
         'Send to print',
-        $Labels,
-        $Enabled)
-    Write-BaleiaLog (($Labels | Select-Object -First 1) + ': ' + $status)
-    return ($status -eq 'selected' -or $status -eq 'already-selected')
+        $Labels)
+}
+
+function Set-MsaaOption {
+    param([string]$Field, [string[]]$Labels, [bool]$Enabled)
+    $wanted = if ($Enabled) { 'on' } else { 'off' }
+    $before = Get-MsaaOptionState $Labels
+    if ([string]::Equals($before, $wanted, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-FieldAudit $Field $wanted $before 'Nenhuma' $before 'JA ESTAVA OK'
+        return $true
+    }
+
+    $after = $before
+    $actions = @()
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        Protect-ConnectWindow
+        $status = [BaleiaMsaaBridge]::SetOption(
+            (Get-ConnectWindow),
+            'Send to print',
+            $Labels,
+            $Enabled)
+        $actions += ($status + ' tentativa ' + $attempt)
+        Start-Sleep -Milliseconds 500
+        $after = Get-MsaaOptionState $Labels
+        if ([string]::Equals($after, $wanted, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-FieldAudit $Field $wanted $before ($actions -join ' / ') $after 'OK'
+            return $true
+        }
+    }
+
+    Write-FieldAudit $Field $wanted $before ($actions -join ' / ') $after 'FALHA'
+    return $false
+}
+
+function Test-FinalOption {
+    param([string]$Field, [string[]]$Labels, [bool]$Enabled)
+    $wanted = if ($Enabled) { 'on' } else { 'off' }
+    $actual = Get-MsaaOptionState $Labels
+    $result = if ([string]::Equals($actual, $wanted, [StringComparison]::OrdinalIgnoreCase)) { 'OK' } else { 'FALHA' }
+    Write-FieldAudit ('FINAL ' + $Field) $wanted $actual 'Somente conferir' $actual $result
+    return ($result -eq 'OK')
+}
+
+function Test-FinalConnectState {
+    param($Manifest, [string]$GcodePath)
+    $allOk = $true
+
+    $printerName = [string](Get-SafeProperty (Get-SafeProperty $Manifest 'printer') 'name')
+    $actualPrinter = Get-MsaaPrinter
+    $printerOk = Test-PrinterSelection $actualPrinter $printerName
+    Write-FieldAudit 'FINAL IMPRESSORA' $printerName $actualPrinter 'Somente conferir' $actualPrinter $(if ($printerOk) { 'OK' } else { 'FALHA' })
+    if (-not $printerOk) { $allOk = $false }
+
+    $expected = @(Get-ExpectedFilaments $Manifest)
+    $cards = @(Wait-MsaaFilamentCards $expected.Count 5)
+    if ($cards.Count -ne $expected.Count) {
+        Write-FieldAudit 'FINAL QUANTIDADE DE FILAMENTOS' ([string]$expected.Count) ([string]$cards.Count) 'Somente conferir' ([string]$cards.Count) 'FALHA'
+        $allOk = $false
+    } else {
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            $wanted = [string]$expected[$index].Slot
+            $card = [string]$cards[$index]
+            $actual = Get-FilamentCardSlot $card
+            $slotOk = [string]::Equals($actual, $wanted, [StringComparison]::OrdinalIgnoreCase)
+            Write-FieldAudit ('FINAL FILAMENTO ' + ($index + 1)) $wanted $card 'Somente conferir' $card $(if ($slotOk) { 'OK' } else { 'FALHA' })
+            if (-not $slotOk) { $allOk = $false }
+        }
+    }
+
+    $options = Get-SafeProperty $Manifest 'options'
+    if (-not (Test-FinalOption 'TIMELAPSE' @('Timelapse') ([bool](Get-SafeProperty $options 'timelapse')))) { $allOk = $false }
+    if (-not (Test-FinalOption 'CALIBRACAO DE FLUXO' @('Flow dynamic calibration','Dynamic flow calibration','Calibracao dinamica de fluxo') ([bool](Get-SafeProperty $options 'flow_calibration')))) { $allOk = $false }
+    if (-not (Test-FinalOption 'NIVELAMENTO' @('Bed leveling','Nivelamento da mesa','Nivelamento automatico') ([bool](Get-SafeProperty $options 'bed_leveling')))) { $allOk = $false }
+
+    $currentHash = ''
+    try { $currentHash = (Get-FileHash -LiteralPath $GcodePath -Algorithm SHA256).Hash } catch {}
+    $hashOk = -not [string]::IsNullOrWhiteSpace($script:ActiveFileHash) -and
+        [string]::Equals($currentHash, $script:ActiveFileHash, [StringComparison]::OrdinalIgnoreCase)
+    Write-FieldAudit 'FINAL ARQUIVO SHA256' $script:ActiveFileHash $currentHash 'Ler novamente' $currentHash $(if ($hashOk) { 'OK' } else { 'FALHA' })
+    if (-not $hashOk) { $allOk = $false }
+
+    $connection = Get-RawConnectionStatus
+    $connectionOk = $connection -eq 'connected'
+    Write-FieldAudit 'FINAL CONEXAO' 'connected' $connection 'Somente conferir' $connection $(if ($connectionOk) { 'OK' } else { 'FALHA' })
+    if (-not $connectionOk) { $allOk = $false }
+
+    return $allOk
 }
 
 function Invoke-ConnectPrintFlow {
@@ -1337,6 +1636,7 @@ function Invoke-ConnectPrintFlow {
         throw 'O Bambu Connect nao concluiu a importacao do arquivo.'
     }
     Write-BaleiaLog ('Import accepted for ' + $Manifest.job_id)
+    Write-JobAudit 'IMPORTACAO: ACEITA PELO CONNECT'
 
     if (-not (Wait-AndPressMsaaButton 'Print' 60)) {
         Write-MsaaSnapshot 'page Print not found'
@@ -1352,16 +1652,22 @@ function Invoke-ConnectPrintFlow {
     $printerName = [string]$Manifest.printer.name
     if (-not (Set-MsaaPrinter $printerName 15)) {
         Write-MsaaSnapshot 'printer selection failed'
-        throw ('A impressora nao foi selecionada no Connect: ' + $printerName)
+        throw ('A impressora nao foi confirmada no Connect: ' + $printerName)
     }
     if (-not (Set-MsaaFilamentMapping $Manifest)) {
         Write-MsaaSnapshot 'filament mapping failed'
-        throw 'O mapeamento de filamentos nao foi aplicado no Connect.'
+        throw 'O mapeamento de filamentos nao foi confirmado no Connect.'
     }
-    if (-not (Set-MsaaOption @('Timelapse') ([bool]$Manifest.options.timelapse))) { throw 'A opcao Timelapse nao foi aplicada no Connect.' }
-    if (-not (Set-MsaaOption @('Flow dynamic calibration','Dynamic flow calibration','Calibracao dinamica de fluxo') ([bool]$Manifest.options.flow_calibration))) { throw 'A calibracao dinamica de fluxo nao foi aplicada no Connect.' }
-    if (-not (Set-MsaaOption @('Bed leveling','Nivelamento da mesa','Nivelamento automatico') ([bool]$Manifest.options.bed_leveling))) { throw 'O nivelamento da mesa nao foi aplicado no Connect.' }
-    if ((Get-RawConnectionStatus) -ne 'connected') { throw 'Bambu Connect desconectou antes do envio. Faca login e tente novamente.' }
+    if (-not (Set-MsaaOption 'TIMELAPSE' @('Timelapse') ([bool]$Manifest.options.timelapse))) { throw 'A opcao Timelapse nao foi confirmada no Connect.' }
+    if (-not (Set-MsaaOption 'CALIBRACAO DE FLUXO' @('Flow dynamic calibration','Dynamic flow calibration','Calibracao dinamica de fluxo') ([bool]$Manifest.options.flow_calibration))) { throw 'A calibracao dinamica de fluxo nao foi confirmada no Connect.' }
+    if (-not (Set-MsaaOption 'NIVELAMENTO' @('Bed leveling','Nivelamento da mesa','Nivelamento automatico') ([bool]$Manifest.options.bed_leveling))) { throw 'O nivelamento da mesa nao foi confirmado no Connect.' }
+
+    Write-JobAudit 'CONFERENCIA FINAL: INICIO'
+    if (-not (Test-FinalConnectState $Manifest $GcodePath)) {
+        Write-MsaaSnapshot 'final verification failed'
+        throw 'A conferencia final encontrou divergencia. O envio foi bloqueado.'
+    }
+    Write-JobAudit 'CONFERENCIA FINAL: OK'
 
     # The final Send has exactly one attempt and never retries.
     $handle = Get-ConnectWindow
@@ -1372,11 +1678,15 @@ function Invoke-ConnectPrintFlow {
         throw 'O botao Send nao esta disponivel. Verifique se a impressora esta ocupada.'
     }
     Write-BaleiaLog ('Send invoked exactly once for ' + $Manifest.job_id + ' on ' + $printerName)
+    Write-JobAudit ('SEND: ACIONADO UMA VEZ PARA ' + $printerName)
     if (-not (Wait-MsaaDialogClosed 'Send to print' 45)) {
         $script:QueueBlocked = $true
         Write-MsaaSnapshot 'final Send result uncertain'
         throw 'O estado do envio ficou incerto. Confira a impressora antes de repetir.'
     }
+    Write-JobAudit 'RESULTADO FINAL: ACEITO PELO CONNECT'
+    Write-BaleiaLog ('Connect accepted job ' + $Manifest.job_id)
+    Show-StatusToast ('Envio conferido: ' + $printerName) $true
     Protect-ConnectWindow
 }
 
@@ -1386,6 +1696,7 @@ function Move-JobToError {
         $script:QueueBlocked = $true
         $Message = 'ATENCAO: o Send pode ter sido acionado. Nao repita este trabalho. ' + $Message
     }
+    Write-JobAudit ('RESULTADO FINAL: BLOQUEADO - ' + $Message)
     try {
         $manifestName = [IO.Path]::GetFileName($ManifestPath)
         $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileNameWithoutExtension($manifestName))
@@ -1398,7 +1709,7 @@ function Move-JobToError {
         Set-Content -LiteralPath (Join-Path $script:ErrorDir ($baseName + '.error.txt')) -Value $Message -Encoding UTF8
     } catch {}
     Write-BaleiaLog ('Job stopped safely: ' + $Message)
-    Show-StatusToast 'Falha no envio. Veja a pasta Erros.' $false
+    Show-StatusToast 'Falha no envio. Veja Erros e Comprovantes.' $false
     if (-not $script:SendMayHaveBeenInvoked -and (Test-BaleiaRunning)) {
         Stop-Connect
         Start-Sleep -Milliseconds 500
@@ -1415,12 +1726,24 @@ function Process-NextJob {
     try { Move-Item -LiteralPath $next.FullName -Destination $workingManifest -ErrorAction Stop } catch { return }
 
     $gcodePath = ''
+    $script:ActiveReceiptPath = ''
+    $script:ActiveFileHash = ''
     try {
         $manifest = Get-Content -LiteralPath $workingManifest -Raw -Encoding UTF8 | ConvertFrom-Json
         $sourceGcode = [string]$manifest.file
+        Start-JobAudit $manifest $sourceGcode
         if (-not (Test-Path -LiteralPath $sourceGcode)) { throw 'O arquivo G-code 3MF da fila desapareceu.' }
+
+        $sourceHash = (Get-FileHash -LiteralPath $sourceGcode -Algorithm SHA256).Hash
+        $sourceLength = [string](Get-Item -LiteralPath $sourceGcode).Length
         $gcodePath = Join-Path $script:WorkingDir ([IO.Path]::GetFileName($sourceGcode))
         Move-Item -LiteralPath $sourceGcode -Destination $gcodePath -ErrorAction Stop
+        $workingHash = (Get-FileHash -LiteralPath $gcodePath -Algorithm SHA256).Hash
+        $hashOk = [string]::Equals($sourceHash, $workingHash, [StringComparison]::OrdinalIgnoreCase)
+        Write-FieldAudit 'ARQUIVO GCODE3MF' ($sourceHash + ' / ' + $sourceLength + ' bytes') $sourceHash 'Mover da Fila para Processando' $workingHash $(if ($hashOk) { 'OK' } else { 'FALHA' })
+        if (-not $hashOk) { throw 'O arquivo mudou dentro da fila. O envio foi bloqueado.' }
+
+        $script:ActiveFileHash = $workingHash
         Write-BaleiaLog ('Processing ' + $manifest.job_id + ' for ' + $manifest.printer.name)
         Invoke-ConnectPrintFlow $manifest $gcodePath
         Remove-Item -LiteralPath $gcodePath -Force -ErrorAction SilentlyContinue
@@ -1428,6 +1751,9 @@ function Process-NextJob {
         Write-BaleiaLog ('Completed ' + $manifest.job_id)
     } catch {
         if (Test-BaleiaRunning) { Move-JobToError $workingManifest $gcodePath $_.Exception.Message }
+    } finally {
+        $script:ActiveReceiptPath = ''
+        $script:ActiveFileHash = ''
     }
 }
 
