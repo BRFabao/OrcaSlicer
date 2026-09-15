@@ -1,14 +1,14 @@
-name: Build Baleia Orca VR004 (Windows x64)
+name: Build Baleia Orca VR005 Diagnostico (Windows x64)
 
 on:
   push:
     branches:
-      - fabao/baleia-vr002-connect-automation
+      - fabao/baleia-vr005-diagnostic-guard
   workflow_dispatch:
 
 jobs:
   check_baleia_helper:
-    name: Validate Baleia VR004 helper
+    name: Validate Baleia VR005 diagnostic helper
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -39,6 +39,21 @@ jobs:
               $content -notmatch "Show-StatusToast 'Desconectado'") {
             throw 'Connected/disconnected status toasts are missing.'
           }
+          $requiredDiagnostic = @(
+            'GetSelectedPrinter'
+            'GetOptionState'
+            'Write-FieldAudit'
+            'Test-FinalConnectState'
+            'Get-FileHash -LiteralPath'
+            'Comprovantes'
+            'JA ESTAVA OK'
+            'RESULTADO FINAL: ACEITO PELO CONNECT'
+          )
+          foreach ($pattern in $requiredDiagnostic) {
+            if (-not $content.Contains($pattern)) {
+              throw "Diagnostic guard is missing: $pattern"
+            }
+          }
           $sendText = 'PressButtonInDialog($handle, ''Send to print'', ''confirm'')'
           if (([regex]::Matches($content, [regex]::Escape($sendText))).Count -ne 1) {
             throw 'The final Send action must exist exactly once.'
@@ -50,7 +65,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   build_windows_x64:
-    name: Build Baleia Orca VR004 portable
+    name: Build Baleia Orca VR005 portable
     needs: check_baleia_helper
     uses: ./.github/workflows/build_check_cache.yml
     with:
