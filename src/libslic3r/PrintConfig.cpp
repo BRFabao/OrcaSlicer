@@ -10531,7 +10531,8 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         case coFloatOrPercent:
         {
             auto *fopt = static_cast<const ConfigOptionFloat*>(opt);
-            out_of_range = !optdef->is_value_valid(fopt->value);
+            const bool automatic_expansion = opt_key == "raft_first_layer_expansion" && fopt->value == -1.;
+            out_of_range = !automatic_expansion && !optdef->is_value_valid(fopt->value);
             break;
         }
         case coFloats:
@@ -10545,7 +10546,8 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         case coInt:
         {
             auto *iopt = static_cast<const ConfigOptionInt*>(opt);
-            out_of_range = !optdef->is_value_valid(iopt->value);
+            const bool automatic_walls = opt_key == "tree_support_wall_count" && iopt->value == -1;
+            out_of_range = !automatic_walls && !optdef->is_value_valid(iopt->value);
             break;
         }
         case coInts:

@@ -1358,7 +1358,8 @@ void TreeSupport::generate_toolpaths()
     coordf_t support_extrusion_width = m_support_params.support_extrusion_width;
     coordf_t nozzle_diameter = m_print_config->nozzle_diameter.get_at(object_config.support_filament - 1);
     coordf_t layer_height = object_config.layer_height.value;
-    const size_t wall_count = object_config.tree_support_wall_count.value;
+    // Bambu's -1 and Orca's 0 both request automatic wall selection.
+    const size_t wall_count = std::max(0, object_config.tree_support_wall_count.value);
 
     // Check if set to zero, use default if so.
     if (support_extrusion_width <= 0.0)
@@ -1396,7 +1397,7 @@ void TreeSupport::generate_toolpaths()
             raft_areas.push_back(expoly);
     }
 
-    raft_areas = std::move(offset_ex(raft_areas, scale_(object_config.raft_first_layer_expansion)));
+    raft_areas = std::move(offset_ex(raft_areas, scale_(object_config.raft_first_layer_expansion.value == -1. ? 3. : object_config.raft_first_layer_expansion.value)));
 
     size_t layer_nr = 0;
     for (; layer_nr < m_slicing_params.base_raft_layers; layer_nr++) {
@@ -1636,7 +1637,7 @@ void TreeSupport::generate_toolpaths()
                             }
                             else {
                                 SupportParameters support_params = m_support_params;
-                                if (area_group.need_extra_wall && object_config.tree_support_wall_count.value == 0)
+                                if (area_group.need_extra_wall && wall_count == 0)
                                     support_params.tree_branch_diameter_double_wall_area_scaled = 0.1;
                                 tree_supports_generate_paths(base_dst, loops, flow, support_params);
                             }
@@ -2133,7 +2134,7 @@ void TreeSupport::draw_circles()
                             }
                         }
                         if (obj_layer_nr == 0 && m_raft_layers == 0) {
-                            double brim_width = !config.tree_support_auto_brim ? tree_brim_width : std::max(MIN_BRANCH_RADIUS_FIRST_LAYER, std::min(node.radius + node.dist_mm_to_top / (scale * branch_radius) * 0.5, MAX_BRANCH_RADIUS_FIRST_LAYER) - node.radius);
+                            double brim_width = config.raft_first_layer_expansion.value != -1. && !config.tree_support_auto_brim ? tree_brim_width : std::max(MIN_BRANCH_RADIUS_FIRST_LAYER, std::min(node.radius + node.dist_mm_to_top / (scale * branch_radius) * 0.5, MAX_BRANCH_RADIUS_FIRST_LAYER) - node.radius);
                             auto tmp=offset(circle, scale_(brim_width));
                             if(!tmp.empty())
                                 circle = tmp[0];
@@ -2329,9 +2330,9 @@ void TreeSupport::draw_circles()
                 // support nodes in Hybrid mode. Apply the expansion before area_groups and
                 // lslices are built so toolpaths and brim avoidance use the same footprint.
                 if (layer_nr == 0 && m_raft_layers == 0 && m_support_params.support_style == smsTreeHybrid &&
-                    m_object_config->raft_first_layer_expansion.value > 0.f) {
+                    m_object_config->raft_first_layer_expansion.value != 0.f) {
                     ExPolygons expanded_base_areas;
-                    const float inflate_factor_1st_layer = float(scale_(m_object_config->raft_first_layer_expansion.value));
+                    const float inflate_factor_1st_layer = float(scale_(m_object_config->raft_first_layer_expansion.value == -1. ? 2. : m_object_config->raft_first_layer_expansion.value));
                     Polygons trimming = offset(m_object->layers().front()->lslices, float(scale_(m_support_params.gap_xy_first_layer)),
                                                SUPPORT_SURFACES_OFFSET_PARAMETERS);
                     // Orca: Match normal support expansion: grow in steps and re-trim against the object each time.

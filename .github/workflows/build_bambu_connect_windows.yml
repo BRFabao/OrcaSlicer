@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fabao/baleia-vr002-connect-automation
+      - qa/baleia-bambu-auto-20261123
   workflow_dispatch:
 
 jobs:
